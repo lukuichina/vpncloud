@@ -200,6 +200,7 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
         try_fail!(cloud.connect(&addr as &str), "Failed to send message to {}: {}", &addr);
         cloud.add_reconnect_peer(addr);
     }
+    #[cfg(unix)]
     if config.daemonize {
         info!("Running process as daemon");
         let mut daemonize = daemonize::Daemonize::new();
@@ -213,16 +214,23 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
             daemonize = daemonize.pid_file(pid_file).chown_pid_file(true);
         }
         try_fail!(daemonize.start(), "Failed to daemonize: {}");
-    } else if config.user.is_some() || config.group.is_some() {
-        info!("Dropping privileges");
-        let mut pd = privdrop::PrivDrop::default();
-        if let Some(user) = config.user {
-            pd = pd.user(user);
+    } else {
+        #[cfg(unix)]
+        if config.user.is_some() || config.group.is_some() {
+            info!("Dropping privileges");
+            let mut pd = privdrop::PrivDrop::default();
+            if let Some(user) = config.user {
+                pd = pd.user(user);
+            }
+            if let Some(group) = config.group {
+                pd = pd.group(group);
+            }
+            try_fail!(pd.apply(), "Failed to drop privileges: {}");
         }
-        if let Some(group) = config.group {
-            pd = pd.group(group);
-        }
-        try_fail!(pd.apply(), "Failed to drop privileges: {}");
+    }
+    #[cfg(not(unix))]
+    if config.daemonize {
+        info!("Daemonize is not supported on this platform");
     }
     cloud.run();
     if let Some(script) = config.ifdown {
@@ -323,7 +331,7 @@ fn main() {
         return;
     }
     #[cfg(feature = "websocket")]
-    if config.listen.starts_with("ws://") {
+    if config.listen.starts_with("ws://") || config.listen.starts_with("wss://") {
         let socket = try_fail!(ProxyConnection::listen(&config.listen), "Failed to open socket {}: {}", config.listen);
         match config.device_type {
             Type::Tap => run::<payload::Frame, _>(config, socket),

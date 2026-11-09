@@ -20,22 +20,24 @@ structopt = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 log = { version = "0.4", features = ["std"] }
-signal = "0.7"
 libc = "0.2"
 rand = "0.8"
 fnv = "1"
 yaml-rust = "0.4"
-daemonize = "0.5"
 ring = "0.17"
-privdrop = "0.5"
 byteorder = "1.4"
 thiserror = "1.0"
 smallvec = "1.7"
 dialoguer = { version = "0.11", optional = true }
-tungstenite = { version = "0.21", optional = true }
+tungstenite = { version = "0.21", optional = true, features = ["rustls-tls-webpki-roots"] }
 url = { version = "2.2", optional = true }
 igd = { version = "0.12", optional = true }
 
+
+[target.'cfg(unix)'.dependencies]
+signal = "0.7"
+privdrop = "0.5"
+daemonize = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
@@ -58,7 +60,10 @@ name = "valgrind"
 harness = false
 
 [profile.release]
-lto = true
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true
 
 [profile.dev]

@@ -126,7 +126,8 @@ impl AsRawFd for ProxyConnection {
     fn as_raw_fd(&self) -> RawFd {
         match self.socket.get_ref() {
             MaybeTlsStream::Plain(stream) => stream.as_raw_fd(),
-            _ => unimplemented!()
+            MaybeTlsStream::Rustls(stream) => stream.get_ref().as_raw_fd(),
+            _ => panic!("unsupported TLS stream type"),
         }
     }
 }
