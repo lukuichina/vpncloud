@@ -35,12 +35,30 @@ somewhat stable state. VpnCloud features the following functionality:
 * Support for different forwarding/routing behaviors (Hub, Switch, Router)
 * NAT and firewall traversal using hole punching
 * Automatic port forwarding via UPnP
-* Websocket proxy mode for restrictive environments
+* Websocket proxy mode for restrictive environments (`--ws-proxy`)
 * Support for tunneled VLans (TAP devices)
 * Support for publishing [beacons](https://vpncloud.ddswd.de/docs/beacons) to help nodes find each others
 * Support for statsd monitoring
 * Low memory footprint
 * Single binary, no dependencies, no kernel module
+
+### `--ws-proxy` behavior
+
+When `--ws-proxy` is given, an embedded WebSocket proxy runs in the same
+process alongside the VPN UDP listener:
+
+* `--ws-proxy 127.0.0.1:8080` — proxy listens on `127.0.0.1:8080`
+* `--ws-proxy :8080` or `--ws-proxy 8080` — IP part may be omitted,
+  defaults to `0.0.0.0` (listens on all interfaces)
+* `--listen` may be omitted when `--ws-proxy` is given; the UDP listener
+  automatically uses the same port as the proxy target
+
+Example:
+
+```sh
+$> vpncloud --ws-proxy :8080 --password mysecret --ip 10.0.0.1/24
+# UDP listens on 0.0.0.0:8080, WS proxy listens on 0.0.0.0:8080
+```
 
 ### Installing
 
@@ -53,7 +71,24 @@ The tests can be run via ``cargo test``.
 
 
 #### Cross-Compiling & packaging
-Please see the [builder folder](builder).
+Use the provided scripts in the repository root:
+
+* `./build-static.sh <target>` — cross-build a stripped static binary for one
+  target into `build-linux-<target>/` (or `build-windows-<target>/`).
+  Supported targets include `x86_64-unknown-linux-musl`,
+  `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`,
+  `mipsel-unknown-linux-musl` (nightly + build-std), etc.
+* `./gz.sh` — package all binaries from `build-linux-*/` into `gz/*.tar.gz`.
+
+Examples:
+
+```sh
+$> ./build-static.sh x86_64-unknown-linux-musl
+$> ./build-static.sh aarch64-unknown-linux-gnu
+$> ./build-static.sh armv7-unknown-linux-gnueabihf
+$> ./build-static.sh mipsel-unknown-linux-musl
+$> ./gz.sh
+```
 
 
 ### Contributions welcome

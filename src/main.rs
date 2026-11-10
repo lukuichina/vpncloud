@@ -48,6 +48,7 @@ use std::{
     process,
     str::FromStr,
     sync::Mutex,
+    thread,
 };
 
 use crate::{
@@ -324,7 +325,16 @@ fn main() {
         };
         config.merge_file(config_file)
     }
+    let listen_was_explicit = args.listen.is_some();
     config.merge_args(args);
+
+    if !listen_was_explicit && config.ws_proxy.is_some() {
+        if let Some(ref ws_proxy) = config.ws_proxy {
+            let port = ws_proxy.rsplit(':').next().unwrap_or(ws_proxy);
+            config.listen = port.to_string();
+            info!("Auto-set listen port {} from --ws-proxy", port);
+        }
+    }
     debug!("Config: {:?}", config);
     if config.crypto.password.is_none() && config.crypto.private_key.is_none() {
         error!("Either password or private key must be set in config or given as parameter");
@@ -340,6 +350,25 @@ fn main() {
         return;
     }
     let socket = try_fail!(UdpSocket::listen(&config.listen), "Failed to open socket {}: {}", config.listen);
+
+    #[cfg(feature = "websocket")]
+    if let Some(ref ws_proxy_addr) = config.ws_proxy {
+        let ws_proxy_listen = if ws_proxy_addr.starts_with(':') {
+            format!("0.0.0.0{}", ws_proxy_addr)
+        } else if ws_proxy_addr.parse::<u16>().is_ok() {
+            format!("0.0.0.0:{}", ws_proxy_addr)
+        } else {
+            ws_proxy_addr.clone()
+        };
+        let ws_proxy_listen_clone = ws_proxy_listen.clone();
+        thread::spawn(move || {
+            if let Err(err) = wsproxy::run_proxy(&ws_proxy_listen_clone) {
+                error!("WebSocket proxy error: {}", err);
+            }
+        });
+        info!("Embedded WebSocket proxy listening on {}", ws_proxy_listen);
+    }
+
     match config.device_type {
         Type::Tap => run::<payload::Frame, _>(config, socket),
         Type::Tun => run::<payload::Packet, _>(config, socket),

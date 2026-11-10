@@ -113,6 +113,7 @@ impl OldConfigFile {
             keepalive: self.keepalive,
             listen: self.listen.or(self.port.map(|p| format!("{}", p))),
             mode: self.mode,
+            ws_proxy: None,
             peer_timeout: self.peer_timeout,
             peers: self.peers,
             pid_file: self.pid_file,

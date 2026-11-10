@@ -26,6 +26,7 @@ pub struct Config {
     pub crypto: CryptoConfig,
 
     pub listen: String,
+    pub ws_proxy: Option<String>,
     pub peers: Vec<String>,
     pub peer_timeout: Duration,
     pub keepalive: Option<Duration>,
@@ -62,6 +63,7 @@ impl Default for Config {
             ifdown: None,
             crypto: CryptoConfig::default(),
             listen: "3210".to_string(),
+            ws_proxy: None,
             peers: vec![],
             peer_timeout: DEFAULT_PEER_TIMEOUT as Duration,
             keepalive: None,
@@ -118,6 +120,9 @@ impl Config {
         }
         if let Some(val) = file.listen {
             self.listen = val;
+        }
+        if let Some(val) = file.ws_proxy {
+            self.ws_proxy = Some(val);
         }
         if let Some(mut val) = file.peers {
             self.peers.append(&mut val);
@@ -224,6 +229,9 @@ impl Config {
         if let Some(val) = args.listen {
             self.listen = val;
         }
+        if let Some(val) = args.ws_proxy {
+            self.ws_proxy = Some(val);
+        }
         self.peers.append(&mut args.peers);
         if let Some(val) = args.peer_timeout {
             self.peer_timeout = val;
@@ -327,6 +335,7 @@ impl Config {
             advertise_addresses: Some(self.advertise_addresses),
             keepalive: self.keepalive,
             listen: Some(self.listen),
+            ws_proxy: self.ws_proxy.clone(),
             mode: Some(self.mode),
             peer_timeout: Some(self.peer_timeout),
             peers: Some(self.peers),
@@ -429,6 +438,10 @@ pub struct Args {
     /// The port number (or ip:port) on which to listen for data
     #[structopt(short, long)]
     pub listen: Option<String>,
+
+    /// Websocket proxy listen address IP:PORT (runs embedded in the VPN process)
+    #[structopt(long = "ws-proxy")]
+    pub ws_proxy: Option<String>,
 
     /// Address of a peer to connect to
     #[structopt(short = "c", long = "peer", alias = "connect")]
@@ -623,6 +636,7 @@ pub struct ConfigFile {
 
     pub crypto: CryptoConfig,
     pub listen: Option<String>,
+    pub ws_proxy: Option<String>,
     pub peers: Option<Vec<String>>,
     pub peer_timeout: Option<Duration>,
     pub keepalive: Option<Duration>,
@@ -716,7 +730,8 @@ statsd:
                 prefix: Some("prefix".to_string())
             }),
             hook: None,
-            hooks: HashMap::new()
+            hooks: HashMap::new(),
+            ws_proxy: None
         }
     )
 }
@@ -766,6 +781,7 @@ fn config_merge() {
         }),
         hook: None,
         hooks: HashMap::new(),
+        ws_proxy: None,
     });
     assert_eq!(
         config,
@@ -864,7 +880,8 @@ fn config_merge() {
             statsd_prefix: Some("prefix2".to_string()),
             daemonize: true,
             hook: None,
-            hooks: HashMap::new()
+            hooks: HashMap::new(),
+            ws_proxy: None
         }
     );
 }
