@@ -12,7 +12,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     io::{Read, Write},
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     str::FromStr,
 };
 
@@ -53,6 +53,21 @@ impl Address {
         let mut data = [0; 16];
         data[0..4].copy_from_slice(&ip.octets());
         Self { data, len: 4 }
+    }
+
+    #[inline]
+    pub fn from_ipv6(ip: Ipv6Addr) -> Self {
+        let mut data = [0; 16];
+        data.copy_from_slice(&ip.octets());
+        Self { data, len: 16 }
+    }
+
+    #[inline]
+    pub fn from_ip(addr: IpAddr) -> Self {
+        match addr {
+            IpAddr::V4(v4) => Self::from_ipv4(v4),
+            IpAddr::V6(v6) => Self::from_ipv6(v6),
+        }
     }
 }
 

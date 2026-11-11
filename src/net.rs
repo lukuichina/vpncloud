@@ -22,9 +22,22 @@ pub fn mapped_addr(addr: SocketAddr) -> SocketAddr {
 }
 
 pub fn get_ip() -> IpAddr {
-    let s = UdpSocket::bind("0.0.0.0:0").unwrap();
-    s.connect("8.8.8.8:0").unwrap();
-    s.local_addr().unwrap().ip()
+    // Try to determine the outbound interface IP by connecting to a well-known
+    // address.  Try IPv4 first, then IPv6, so the function works in both
+    // dual-stack and IPv6-only environments.  If all attempts fail, fall back
+    // to the unspecified address instead of panicking.
+    for (bind_addr, target) in [("0.0.0.0:0", "8.8.8.8:0"), ("[::]:0", "[2001:4860:4860::8888]:0")] {
+        if let Ok(s) = UdpSocket::bind(bind_addr) {
+            if s.connect(target).is_ok() {
+                if let Ok(addr) = s.local_addr() {
+                    return addr.ip();
+                }
+            }
+        }
+    }
+    // Fallback: return an unspecified address.  Callers should handle this
+    // gracefully (e.g. by not advertising an external address).
+    IpAddr::V6(Ipv6Addr::UNSPECIFIED)
 }
 
 pub trait Socket: AsRawFd + Sized {

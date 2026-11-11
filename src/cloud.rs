@@ -10,7 +10,7 @@ use std::{
     hash::BuildHasherDefault,
     io::{self, Cursor, Seek, SeekFrom, Write},
     marker::PhantomData,
-    net::{SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::Path,
     str::FromStr,
 };
@@ -118,7 +118,11 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         if device.get_type() == Type::Tun && config.auto_claim {
             match device.get_ip() {
                 Ok(ip) => {
-                    let range = Range { base: Address::from_ipv4(ip), prefix_len: 32 };
+                    let prefix_len = match ip {
+                        IpAddr::V4(_) => 32,
+                        IpAddr::V6(_) => 128,
+                    };
+                    let range = Range { base: Address::from_ip(ip), prefix_len };
                     info!("Auto-claiming {} due to interface address", range);
                     claims.push(range);
                 }

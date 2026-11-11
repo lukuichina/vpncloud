@@ -42,7 +42,7 @@ use structopt::StructOpt;
 use std::{
     fs::{self, File, Permissions},
     io::{self, Write},
-    net::{Ipv4Addr, UdpSocket},
+    net::{IpAddr, UdpSocket},
     os::unix::fs::PermissionsExt,
     path::Path,
     process,
@@ -60,6 +60,7 @@ use crate::{
     oldconfig::OldConfigFile,
     payload::Protocol,
     util::SystemTimeSource,
+    types::Address,
 };
 
 #[cfg(feature = "websocket")]
@@ -126,18 +127,46 @@ fn run_script(script: &str, ifname: &str) {
     }
 }
 
-fn parse_ip_netmask(addr: &str) -> Result<(Ipv4Addr, Ipv4Addr), String> {
+fn parse_ip_netmask(addr: &str) -> Result<(std::net::IpAddr, std::net::IpAddr), String> {
     let (ip_str, len_str) = match addr.find('/') {
         Some(pos) => (&addr[..pos], &addr[pos + 1..]),
-        None => (addr, "24"),
+        None => (addr, ""),
     };
-    let prefix_len = u8::from_str(len_str).map_err(|_| format!("Invalid prefix length: {}", len_str))?;
-    if prefix_len > 32 {
-        return Err(format!("Invalid prefix length: {}", prefix_len));
+    let ip = std::net::IpAddr::from_str(ip_str).map_err(|_| format!("Invalid ip address: {}", ip_str))?;
+    let prefix_len = if len_str.is_empty() {
+        match ip {
+            std::net::IpAddr::V4(_) => 24,
+            std::net::IpAddr::V6(_) => 64,
+        }
+    } else {
+        u8::from_str(len_str).map_err(|_| format!("Invalid prefix length: {}", len_str))?
+    };
+    match ip {
+        std::net::IpAddr::V4(_) => {
+            if prefix_len > 32 {
+                return Err(format!("Invalid prefix length: {}", prefix_len));
+            }
+            let netmask = std::net::Ipv4Addr::from(u32::max_value().checked_shl(32 - prefix_len as u32).unwrap());
+            Ok((ip, std::net::IpAddr::V4(netmask)))
+        }
+        std::net::IpAddr::V6(_) => {
+            if prefix_len > 128 {
+                return Err(format!("Invalid prefix length: {}", prefix_len));
+            }
+            // IPv6 使用前缀长度表示，掩码地址用全 1 前缀 + 全 0 后缀构造
+            let mut octets = [0u8; 16];
+            let full_bytes = prefix_len / 8;
+            let rem_bits = prefix_len % 8;
+            for i in 0..full_bytes as usize {
+                octets[i] = 0xff;
+            }
+            if rem_bits > 0 {
+                octets[full_bytes as usize] = !(0xff >> rem_bits);
+            }
+            let netmask = std::net::Ipv6Addr::from(octets);
+            Ok((ip, std::net::IpAddr::V6(netmask)))
+        }
     }
-    let ip = Ipv4Addr::from_str(ip_str).map_err(|_| format!("Invalid ip address: {}", ip_str))?;
-    let netmask = Ipv4Addr::from(u32::max_value().checked_shl(32 - prefix_len as u32).unwrap());
-    Ok((ip, netmask))
 }
 
 fn setup_device(config: &Config) -> TunTapDevice {
@@ -155,7 +184,45 @@ fn setup_device(config: &Config) -> TunTapDevice {
     if let Some(ip) = &config.ip {
         let (ip, netmask) = try_fail!(parse_ip_netmask(ip), "Invalid ip address given: {}");
         info!("Configuring device with ip {}, netmask {}", ip, netmask);
-        try_fail!(device.configure(ip, netmask), "Failed to configure device: {}");
+        if let Err(e) = device.configure(ip, netmask) {
+            fail!("Failed to configure device: {}: {}", ip, e);
+        }
+
+// Automatic underlay routing: add routes for claimed subnets via the TUN device
+        if let IpAddr::V6(_) = ip {
+            for claim_str in &config.claims {
+                if let Ok(claim) = crate::types::Range::from_str(claim_str) {
+                    match claim.base {
+                        Address { data, len: 16 } => {
+                            // IPv6 claim: convert 16-byte address back to Ipv6Addr
+                            let ip6 = std::net::Ipv6Addr::from(data);
+                            let prefix = claim.prefix_len;
+                            if prefix > 0 && prefix <= 128 {
+                                let ifname = device.ifname();
+                                let status = std::process::Command::new("ip")
+                                    .args(["route", "add", &format!("{}/{}", ip6, prefix), "dev", ifname])
+                                    .status();
+                                match status {
+                                    Ok(s) if s.success() => {
+                                        info!("Added IPv6 route {}/{} via dev {}", ip6, prefix, ifname);
+                                    }
+                                    Ok(s) => {
+                                        warn!("Failed to add IPv6 route {}/{} via dev {}: status {:?}", ip6, prefix, ifname, s);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to add IPv6 route {}/{} via dev {}: {}", ip6, prefix, ifname, e);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // IPv4 claims are handled by the kernel's existing routing or ifup script
+                        }
+                    }
+                }
+            }
+        }
+
     }
     if let Some(script) = &config.ifup {
         run_script(script, device.ifname());
@@ -342,7 +409,11 @@ fn main() {
     }
     #[cfg(feature = "websocket")]
     if config.listen.starts_with("ws://") || config.listen.starts_with("wss://") {
-        let socket = try_fail!(ProxyConnection::listen(&config.listen), "Failed to open socket {}: {}", config.listen);
+        let socket = if config.insecure {
+            try_fail!(ProxyConnection::connect(&config.listen, true), "Failed to open socket {}: {}", config.listen)
+        } else {
+            try_fail!(ProxyConnection::listen(&config.listen), "Failed to open socket {}: {}", config.listen)
+        };
         match config.device_type {
             Type::Tap => run::<payload::Frame, _>(config, socket),
             Type::Tun => run::<payload::Packet, _>(config, socket),

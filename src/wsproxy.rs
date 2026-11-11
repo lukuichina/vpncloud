@@ -13,10 +13,56 @@ use std::{
     io::{self, Cursor, Read, Write},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream, UdpSocket},
     os::unix::io::{AsRawFd, RawFd},
+    sync::Arc,
     thread::spawn,
 };
-use tungstenite::{connect, protocol::WebSocket, Message, accept, stream::{MaybeTlsStream, NoDelay}};
+use tungstenite::{protocol::WebSocket, Message, accept, stream::{MaybeTlsStream, NoDelay}, Connector, client_tls_with_config, connect};
 use url::Url;
+use rustls::client::danger::{ServerCertVerifier, ServerCertVerified, HandshakeSignatureValid};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+/// A certificate verifier that accepts all certificates (for --insecure mode)
+#[derive(Clone, Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+        ]
+    }
+}
 
 macro_rules! io_error {
     ($val:expr, $format:expr) => ( {
@@ -110,9 +156,49 @@ pub fn run_proxy(listen: &str) -> Result<(), io::Error> {
 pub struct ProxyConnection {
     addr: SocketAddr,
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    insecure: bool,
 }
 
 impl ProxyConnection {
+    /// Connect to a wss:// URL, optionally skipping TLS certificate verification
+    pub fn connect(url: &str, insecure: bool) -> Result<Self, io::Error> {
+        let parsed_url = io_error!(Url::parse(url), "Invalid URL {}: {}", url)?;
+        let mut socket = if insecure && parsed_url.scheme() == "wss" {
+            let config = Arc::new(
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                    .with_no_client_auth(),
+            );
+            let domain = parsed_url.domain().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, format!("No domain in URL {}", url))
+            })?;
+            let port = parsed_url.port_or_known_default().unwrap_or(443);
+            let addr = format!("{}:{}", domain, port);
+            let tcp_stream = TcpStream::connect(&addr)?;
+            let connector = Connector::Rustls(config);
+            let (ws, _) = client_tls_with_config(
+                parsed_url.as_str(),
+                tcp_stream,
+                None,
+                Some(connector),
+            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS error: {}", e)))?;
+            ws
+        } else {
+            let (socket, _) = io_error!(
+                tungstenite::connect(parsed_url),
+                "Failed to connect to URL {}: {}", url
+            )?;
+            socket
+        };
+        socket.get_mut().set_nodelay(true)?;
+        let addr = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
+        let mut con = ProxyConnection { addr, socket, insecure: false };
+        let addr_data = con.read_message()?;
+        con.addr = read_addr(Cursor::new(&addr_data))?;
+        Ok(con)
+    }
+
     fn read_message(&mut self) -> Result<Vec<u8>, io::Error> {
         loop {
             if let Message::Binary(data) = io_error!(self.socket.read(), "Failed to read from ws proxy: {}")? {
@@ -135,10 +221,10 @@ impl AsRawFd for ProxyConnection {
 impl Socket for ProxyConnection {
     fn listen(url: &str) -> Result<Self, io::Error> {
         let parsed_url = io_error!(Url::parse(url), "Invalid URL {}: {}", url)?;
-        let (mut socket, _) = io_error!(connect(parsed_url), "Failed to connect to URL {}: {}", url)?;
+        let (mut socket, _) = io_error!(tungstenite::connect(parsed_url), "Failed to connect to URL {}: {}", url)?;
         socket.get_mut().set_nodelay(true)?;
         let addr = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
-        let mut con = ProxyConnection { addr, socket };
+        let mut con = ProxyConnection { addr, socket, insecure: false };
         let addr_data = con.read_message()?;
         con.addr = read_addr(Cursor::new(&addr_data))?;
         Ok(con)

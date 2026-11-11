@@ -25,6 +25,9 @@ pub struct Config {
 
     pub crypto: CryptoConfig,
 
+    /// Skip TLS certificate verification for wss:// connections
+    pub insecure: bool,
+
     pub listen: String,
     pub ws_proxy: Option<String>,
     pub peers: Vec<String>,
@@ -62,6 +65,7 @@ impl Default for Config {
             ifup: None,
             ifdown: None,
             crypto: CryptoConfig::default(),
+            insecure: false,
             listen: "3210".to_string(),
             ws_proxy: None,
             peers: vec![],
@@ -132,6 +136,9 @@ impl Config {
         }
         if let Some(val) = file.keepalive {
             self.keepalive = Some(val);
+        }
+        if let Some(val) = file.insecure {
+            self.insecure = val;
         }
         if let Some(beacon) = file.beacon {
             if let Some(val) = beacon.store {
@@ -264,6 +271,9 @@ impl Config {
         if args.no_port_forwarding {
             self.port_forwarding = false;
         }
+        if args.insecure {
+            self.insecure = true;
+        }
         if args.daemon {
             self.daemonize = true;
         }
@@ -344,6 +354,7 @@ impl Config {
             stats_file: self.stats_file,
             statsd: Some(ConfigFileStatsd { server: self.statsd_server, prefix: self.statsd_prefix }),
             switch_timeout: Some(self.switch_timeout),
+            insecure: None,
             hook: self.hook,
             hooks: self.hooks,
         }
@@ -507,6 +518,10 @@ pub struct Args {
     #[structopt(long)]
     pub no_port_forwarding: bool,
 
+    /// Skip TLS certificate verification for wss:// connections
+    #[structopt(long)]
+    pub insecure: bool,
+
     /// Run the process in the background
     #[structopt(long)]
     pub daemon: bool,
@@ -641,6 +656,9 @@ pub struct ConfigFile {
     pub peer_timeout: Option<Duration>,
     pub keepalive: Option<Duration>,
 
+    /// Skip TLS certificate verification for wss:// connections
+    pub insecure: Option<bool>,
+
     pub beacon: Option<ConfigFileBeacon>,
     pub mode: Option<Mode>,
     pub switch_timeout: Option<Duration>,
@@ -731,7 +749,8 @@ statsd:
             }),
             hook: None,
             hooks: HashMap::new(),
-            ws_proxy: None
+            ws_proxy: None,
+            insecure: None
         }
     )
 }
@@ -782,6 +801,7 @@ fn config_merge() {
         hook: None,
         hooks: HashMap::new(),
         ws_proxy: None,
+        insecure: None,
     });
     assert_eq!(
         config,
@@ -881,7 +901,8 @@ fn config_merge() {
             daemonize: true,
             hook: None,
             hooks: HashMap::new(),
-            ws_proxy: None
+            ws_proxy: None,
+            insecure: false
         }
     );
 }

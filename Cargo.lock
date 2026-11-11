@@ -1274,6 +1274,8 @@ dependencies = [
  "privdrop",
  "rand",
  "ring",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_yaml",
  "signal",

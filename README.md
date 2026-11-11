@@ -36,6 +36,7 @@ somewhat stable state. VpnCloud features the following functionality:
 * NAT and firewall traversal using hole punching
 * Automatic port forwarding via UPnP
 * Websocket proxy mode for restrictive environments (`--ws-proxy`)
+* IPv6 support (dual-stack UDP, IPv6 TUN addresses, IPv6 route auto-configuration)
 * Support for tunneled VLans (TAP devices)
 * Support for publishing [beacons](https://vpncloud.ddswd.de/docs/beacons) to help nodes find each others
 * Support for statsd monitoring
@@ -58,6 +59,90 @@ Example:
 ```sh
 $> vpncloud --ws-proxy :8080 --password mysecret --ip 10.0.0.1/24
 # UDP listens on 0.0.0.0:8080, WS proxy listens on 0.0.0.0:8080
+```
+
+### `--insecure` (skip TLS certificate verification for wss://)
+
+When connecting to a `wss://` URL, vpnCloud normally verifies the remote
+server's TLS certificate. If the certificate is not yet valid, self-signed,
+or otherwise untrusted, the connection fails with `invalid peer certificate`.
+Use `--insecure` to skip certificate verification:
+
+```sh
+$> vpncloud --ip fd03::3 -l wss://vnetc.swings.one:443 -c 127.0.0.1:8788 -p 123 --insecure
+```
+
+⚠️ **Warning**: `--insecure` disables server certificate validation and makes
+the connection vulnerable to man-in-the-middle attacks. Only use it for
+testing or when you trust the remote endpoint. Not recommended for production.
+
+### IPv6 Support
+
+VpnCloud supports IPv6 for both the underlay transport and the virtual TUN interface.
+
+**IPv6 TUN address:**
+```sh
+$> vpncloud --ip fd03::3/64 -p mysecret
+```
+The `--ip` parameter accepts IPv6 addresses with CIDR notation (e.g. `fd03::3/64`). If the prefix length is omitted, `/64` is used by default for IPv6.
+
+**Auto-claim:**
+When an IP address is configured on the TUN device, vpnCloud automatically claims that exact address (`/128` for IPv6, `/32` for IPv4) so that direct peer-to-peer communication works without any additional `--claim`. For example:
+
+```sh
+$> vpncloud --ip fd03::3/64 -p mysecret   # auto-claims fd03::3/128
+$> vpncloud --ip 10.0.0.1/24 -p mysecret  # auto-claims 10.0.0.1/32
+```
+
+**Automatic underlay routing:**
+To route an entire subnet through the TUN device, explicitly claim it:
+
+```sh
+$> vpncloud --ip fd03::3/64 -p mysecret --claim fd03::/64
+```
+vpnCloud automatically adds `ip route add fd03::/64 dev vpncloud0` for IPv6 claims.
+
+**IPv6 listening:**
+The UDP listener binds to an IPv6 dual-stack socket by default (`[::]:PORT`), accepting both IPv4 and IPv6 connections. WebSocket proxy addresses also support IPv6.
+
+**Example: IPv6-only node (no --claim needed for direct IP ping)**
+```sh
+$> vpncloud --ip fd03::3/64 -p mysecret --peer REMOTE_HOST:PORT
+```
+
+**Example: IPv4 node (existing behavior unchanged)**
+```sh
+$> vpncloud --ip 10.0.0.1/24 -p mysecret --peer REMOTE_HOST:PORT
+```
+
+For dual-stack operation (both IPv4 and IPv6 on the same TUN device), configure the second address via the `--ifup` script or config file, since `--ip` accepts a single address.
+
+### Authentication: `--password` vs `--private-key`/`--public-key`
+
+vpnCloud supports two authentication methods:
+
+**`--password <password>` (shared secret):**
+A simple pre-shared password. Both sides must use the same password. The password is fed through PBKDF2 to derive the Curve25519 key pair, so **the same password always produces the same key pair on every node**. This works for small setups, but all nodes with the same password share the same public key, which limits peer differentiation and access control.
+
+```sh
+$> vpncloud --ip 10.0.0.1/24 -p mysecret --peer REMOTE_HOST:PORT
+```
+
+**`--private-key` / `--public-key` / `--trusted-key` (explicit keys):**
+Generate a unique key pair per node with `vpncloud genkey`, then distribute public keys via `--trusted-key`. This is the recommended method for production use, as each node has a unique identity and you can explicitly choose which peers to trust.
+
+```sh
+# Generate a key pair
+$> vpncloud genkey
+Private key: HoFrm2jbJHp7RDwKvA9LUyNbPbJXP7TAQjvvNWKqX6x
+Public key: tTzcYNnZtTvk5kFluKr1shsodAE3sRmXgIIoHr73bGV
+
+# Run with explicit keys
+$> vpncloud --ip fd03::3/64 \
+  --private-key HoFrm2jbJHp7RDwKvA9LUyNbPbJXP7TAQjvvNWKqX6x \
+  --public-key tTzcYNnZtTvk5kFluKr1shsodAE3sRmXgIIoHr73bGV \
+  --trusted-key <peer-public-key> \
+  -l [::]:2600
 ```
 
 ### Installing

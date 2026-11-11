@@ -9,7 +9,7 @@ use std::{
     fmt,
     fs::{self, File},
     io::{self, BufRead, BufReader, Cursor, Error as IoError, Read, Write},
-    net::{Ipv4Addr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket},
     os::{unix::io::AsRawFd, fd::RawFd},
     str,
     str::FromStr
@@ -112,7 +112,7 @@ pub trait Device: AsRawFd {
     /// This method will return an error if the underlying read call fails.
     fn write(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error>;
 
-    fn get_ip(&self) -> Result<Ipv4Addr, Error>;
+    fn get_ip(&self) -> Result<IpAddr, Error>;
 }
 
 /// Represents a tun/tap device
@@ -243,9 +243,20 @@ impl TunTapDevice {
         set_device_mtu(&self.ifname, value)
     }
 
-    pub fn configure(&self, addr: Ipv4Addr, netmask: Ipv4Addr) -> io::Result<()> {
-        set_device_addr(&self.ifname, addr)?;
-        set_device_netmask(&self.ifname, netmask)?;
+    pub fn configure(&self, addr: IpAddr, netmask: IpAddr) -> io::Result<()> {
+        match addr {
+            IpAddr::V4(addr) => {
+                if let IpAddr::V4(mask) = netmask {
+                    set_device_addr(&self.ifname, addr)?;
+                    set_device_netmask(&self.ifname, mask)?;
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv4 address requires IPv4 netmask"));
+                }
+            }
+            IpAddr::V6(addr) => {
+                set_device_addr_v6(&self.ifname, addr, netmask)?;
+            }
+        }
         set_device_enabled(&self.ifname, true)
     }
 
@@ -291,7 +302,7 @@ impl Device for TunTapDevice {
         }
     }
 
-    fn get_ip(&self) -> Result<Ipv4Addr, Error> {
+    fn get_ip(&self) -> Result<IpAddr, Error> {
         get_device_addr(&self.ifname).map_err(|e| Error::DeviceIo("Error getting IP address", e))
     }
 }
@@ -351,7 +362,7 @@ impl Device for MockDevice {
         Ok(())
     }
 
-    fn get_ip(&self) -> Result<Ipv4Addr, Error> {
+    fn get_ip(&self) -> Result<IpAddr, Error> {
         Err(Error::Device("Dummy devices have no IP address"))
     }
 }
@@ -393,21 +404,77 @@ fn get_device_mtu(ifname: &str) -> io::Result<usize> {
 }
 
 #[allow(clippy::useless_conversion)]
-fn get_device_addr(ifname: &str) -> io::Result<Ipv4Addr> {
+fn get_device_addr(ifname: &str) -> io::Result<IpAddr> {
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     let mut ifreq = IfReq::new(ifname);
     let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFADDR.try_into().unwrap(), &mut ifreq) };
-    match res {
-        0 => {
-            let af = unsafe { ifreq.data.addr.af };
-            if af as libc::c_int != libc::AF_INET {
-                return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "Invalid address family".to_owned()));
+    if res == 0 {
+        let af = unsafe { ifreq.data.addr.af };
+        match af as libc::c_int {
+            libc::AF_INET => {
+                let ip = unsafe { ifreq.data.addr.addr };
+                return Ok(IpAddr::V4(ip));
             }
-            let ip = unsafe { ifreq.data.addr.addr };
-            Ok(ip)
+            libc::AF_INET6 => {
+                return get_device_addr_v6_fallback(ifname);
+            }
+            _ => {}
         }
-        _ => Err(IoError::last_os_error()),
     }
+    // SIOCGIFADDR may fail for IPv6-only interfaces; fall back to /proc/net/if_inet6
+    get_device_addr_v6_fallback(ifname)
+}
+
+fn get_device_addr_v6_fallback(ifname: &str) -> io::Result<IpAddr> {
+    // Try reading /proc/net/if_inet6 for IPv6 addresses on this interface
+    if let Ok(contents) = fs::read_to_string("/proc/net/if_inet6") {
+        let mut global_addr: Option<Ipv6Addr> = None;
+        let mut any_addr: Option<Ipv6Addr> = None;
+        for line in contents.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 6 {
+                continue;
+            }
+            // if_inet6 format: addr(32 hex) plen(2) scope(2) dad_status(2) flags(4) ifname
+            let addr_hex = parts[0];
+            let if_name = parts[5];
+            if if_name != ifname {
+                continue;
+            }
+            if let Ok(addr) = parse_inet6_addr(addr_hex) {
+                // Skip link-local addresses (fe80::/10) if we can find a better one
+                if addr.is_unicast_link_local() {
+                    if any_addr.is_none() {
+                        any_addr = Some(addr);
+                    }
+                    continue;
+                }
+                if global_addr.is_none() {
+                    global_addr = Some(addr);
+                }
+            }
+        }
+        // Prefer global/unicast address over link-local
+        if let Some(addr) = global_addr {
+            return Ok(IpAddr::V6(addr));
+        }
+        if let Some(addr) = any_addr {
+            return Ok(IpAddr::V6(addr));
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "No IPv6 address found on interface".to_owned()))
+}
+
+fn parse_inet6_addr(hex: &str) -> io::Result<Ipv6Addr> {
+    if hex.len() != 32 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid IPv6 address length in if_inet6"));
+    }
+    let mut octets = [0u8; 16];
+    for i in 0..16 {
+        octets[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid hex in if_inet6"))?;
+    }
+    Ok(Ipv6Addr::from(octets))
 }
 
 #[allow(clippy::useless_conversion)]
@@ -423,9 +490,35 @@ fn set_device_addr(ifname: &str, addr: Ipv4Addr) -> io::Result<()> {
     }
 }
 
+fn set_device_addr_v6(ifname: &str, addr: Ipv6Addr, _netmask: IpAddr) -> io::Result<()> {
+    // Linux SIOCSIFADDR ioctl has limited IPv6 support; use `ip addr add` instead.
+    let prefix = addr.to_string();
+    let plen = match _netmask {
+        IpAddr::V6(netmask) => {
+            // Calculate prefix length from netmask
+            let octets = netmask.octets();
+            let mut plen = 0u8;
+            for &octet in &octets {
+                plen += octet.count_ones() as u8;
+            }
+            plen
+        }
+        IpAddr::V4(_) => 64,
+    };
+    let status = std::process::Command::new("ip")
+        .args(["addr", "add", &format!("{}/{}", prefix, plen), "dev", ifname])
+        .status()
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("`ip` command not found: {}", e)))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(io::ErrorKind::Other, format!("`ip addr add` failed with status {:?}", status)))
+    }
+}
+
 #[allow(dead_code)]
 #[allow(clippy::useless_conversion)]
-fn get_device_netmask(ifname: &str) -> io::Result<Ipv4Addr> {
+fn get_device_netmask(ifname: &str) -> io::Result<IpAddr> {
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     let mut ifreq = IfReq::new(ifname);
     let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFNETMASK.try_into().unwrap(), &mut ifreq) };
@@ -436,7 +529,7 @@ fn get_device_netmask(ifname: &str) -> io::Result<Ipv4Addr> {
                 return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "Invalid address family".to_owned()));
             }
             let ip = unsafe { ifreq.data.addr.addr };
-            Ok(ip)
+            Ok(IpAddr::V4(ip))
         }
         _ => Err(IoError::last_os_error()),
     }
