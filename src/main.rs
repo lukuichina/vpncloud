@@ -395,6 +395,14 @@ fn main() {
     let listen_was_explicit = args.listen.is_some();
     config.merge_args(args);
 
+    // --ipv6 <addr>: use specified IPv6 address when --ip is not given
+    if let Some(ref ipv6_addr) = config.ipv6 {
+        if config.ip.is_none() {
+            info!("Using IPv6 address {} due to --ipv6", ipv6_addr);
+            config.ip = Some(ipv6_addr.clone());
+        }
+    }
+
     if !listen_was_explicit && config.ws_proxy.is_some() {
         if let Some(ref ws_proxy) = config.ws_proxy {
             let port = ws_proxy.rsplit(':').next().unwrap_or(ws_proxy);

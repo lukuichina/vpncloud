@@ -86,6 +86,21 @@ $> vpncloud --ip fd03::3/64 -p mysecret
 ```
 The `--ip` parameter accepts IPv6 addresses with CIDR notation (e.g. `fd03::3/64`). If the prefix length is omitted, `/64` is used by default for IPv6.
 
+**`--ipv6 <addr>` (manual IPv6 address):**
+When `--ip` is not given, `--ipv6 <addr>` specifies the IPv6 address for the TUN interface directly. It is equivalent to `--ip <addr>` but only accepts IPv6 addresses:
+
+```sh
+$> vpncloud --ipv6 fd03::3 -p mysecret   # configured as fd03::3/64
+```
+
+This is useful when you want to run an IPv6-only node without specifying `--ip`. Like `--ip`, the prefix length defaults to `/64` when omitted, so the system route `fd03::/64 dev vpncloud0` is added automatically and direct peer ping works without any additional `--claim`.
+
+Example:
+
+```sh
+$> vpncloud --ipv6 fd03::3 -p mysecret --peer REMOTE_HOST:PORT
+```
+
 **Auto-claim:**
 When an IP address is configured on the TUN device, vpnCloud automatically claims that exact address (`/128` for IPv6, `/32` for IPv4) so that direct peer-to-peer communication works without any additional `--claim`. For example:
 

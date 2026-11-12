@@ -19,6 +19,8 @@ pub struct Config {
     pub fix_rp_filter: bool,
 
     pub ip: Option<String>,
+    /// Specify an IPv6 address for the interface (e.g. --ipv6 fd03::2)
+    pub ipv6: Option<String>,
     pub advertise_addresses: Vec<String>,
     pub ifup: Option<String>,
     pub ifdown: Option<String>,
@@ -61,6 +63,7 @@ impl Default for Config {
             device_path: None,
             fix_rp_filter: false,
             ip: None,
+            ipv6: None,
             advertise_addresses: vec![],
             ifup: None,
             ifdown: None,
@@ -112,6 +115,9 @@ impl Config {
         }
         if let Some(val) = file.ip {
             self.ip = Some(val);
+        }
+        if let Some(val) = file.ipv6 {
+            self.ipv6 = Some(val);
         }
         if let Some(mut val) = file.advertise_addresses {
             self.advertise_addresses.append(&mut val);
@@ -225,6 +231,9 @@ impl Config {
         }
         if let Some(val) = args.ip {
             self.ip = Some(val);
+        }
+        if let Some(val) = args.ipv6 {
+            self.ipv6 = Some(val);
         }
         if let Some(val) = args.ifup {
             self.ifup = Some(val);
@@ -342,6 +351,7 @@ impl Config {
             ifup: self.ifup,
             ifdown: self.ifdown,
             ip: self.ip,
+            ipv6: self.ipv6.clone(),
             advertise_addresses: Some(self.advertise_addresses),
             keepalive: self.keepalive,
             listen: Some(self.listen),
@@ -498,6 +508,10 @@ pub struct Args {
     #[structopt(long)]
     pub ip: Option<String>,
 
+    /// Specify an IPv6 address for the interface (e.g. --ipv6 fd03::2)
+    #[structopt(long)]
+    pub ipv6: Option<String>,
+
     /// A list of IP Addresses to advertise as our external address(s)
     #[structopt(long = "advertise_addresses", use_delimiter = true)]
     pub advertise_addresses: Vec<String>,
@@ -645,6 +659,7 @@ pub struct ConfigFile {
     pub device: Option<ConfigFileDevice>,
 
     pub ip: Option<String>,
+    pub ipv6: Option<String>,
     pub advertise_addresses: Option<Vec<String>>,
     pub ifup: Option<String>,
     pub ifdown: Option<String>,
@@ -750,6 +765,7 @@ statsd:
             hook: None,
             hooks: HashMap::new(),
             ws_proxy: None,
+            ipv6: None,
             insecure: None
         }
     )
@@ -801,6 +817,7 @@ fn config_merge() {
         hook: None,
         hooks: HashMap::new(),
         ws_proxy: None,
+        ipv6: None,
         insecure: None,
     });
     assert_eq!(
@@ -810,6 +827,7 @@ fn config_merge() {
             device_name: "vpncloud%d".to_string(),
             device_path: None,
             ip: None,
+            ipv6: None,
             advertise_addresses: vec![],
             ifup: Some("ifconfig $IFNAME 10.0.1.1/16 mtu 1400 up".to_string()),
             ifdown: Some("true".to_string()),
@@ -870,6 +888,7 @@ fn config_merge() {
             device_path: Some("/dev/null".to_string()),
             fix_rp_filter: false,
             ip: None,
+            ipv6: None,
             advertise_addresses: vec![],
 
             ifup: Some("ifconfig $IFNAME 10.0.1.2/16 mtu 1400 up".to_string()),

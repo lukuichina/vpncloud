@@ -40,6 +40,22 @@ pub fn get_ip() -> IpAddr {
     IpAddr::V6(Ipv6Addr::UNSPECIFIED)
 }
 
+/// Try to detect the outbound IPv6 address of this host.
+///
+/// Returns None when no IPv6 connectivity is available.
+pub fn get_ip_v6() -> Option<Ipv6Addr> {
+    if let Ok(s) = UdpSocket::bind("[::]:0") {
+        if s.connect("[2001:4860:4860::8888]:0").is_ok() {
+            if let Ok(addr) = s.local_addr() {
+                if let IpAddr::V6(ip6) = addr.ip() {
+                    return Some(ip6);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub trait Socket: AsRawFd + Sized {
     fn listen(addr: &str) -> Result<Self, io::Error>;
     fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error>;
