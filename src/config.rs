@@ -21,6 +21,9 @@ pub struct Config {
     pub ip: Option<String>,
     /// Specify an IPv6 address for the interface (e.g. --ipv6 fd03::2)
     pub ipv6: Option<String>,
+    /// SNI hostname for wss:// connections. When --ws-proxy/--listen target is an IP address,
+    /// --sni overrides the TLS SNI and HTTP Host header to this value.
+    pub sni: Option<String>,
     pub advertise_addresses: Vec<String>,
     pub ifup: Option<String>,
     pub ifdown: Option<String>,
@@ -64,6 +67,7 @@ impl Default for Config {
             fix_rp_filter: false,
             ip: None,
             ipv6: None,
+            sni: None,
             advertise_addresses: vec![],
             ifup: None,
             ifdown: None,
@@ -118,6 +122,9 @@ impl Config {
         }
         if let Some(val) = file.ipv6 {
             self.ipv6 = Some(val);
+        }
+        if let Some(val) = file.sni {
+            self.sni = Some(val);
         }
         if let Some(mut val) = file.advertise_addresses {
             self.advertise_addresses.append(&mut val);
@@ -234,6 +241,9 @@ impl Config {
         }
         if let Some(val) = args.ipv6 {
             self.ipv6 = Some(val);
+        }
+        if let Some(val) = args.sni {
+            self.sni = Some(val);
         }
         if let Some(val) = args.ifup {
             self.ifup = Some(val);
@@ -352,6 +362,7 @@ impl Config {
             ifdown: self.ifdown,
             ip: self.ip,
             ipv6: self.ipv6.clone(),
+            sni: self.sni.clone(),
             advertise_addresses: Some(self.advertise_addresses),
             keepalive: self.keepalive,
             listen: Some(self.listen),
@@ -512,6 +523,11 @@ pub struct Args {
     #[structopt(long)]
     pub ipv6: Option<String>,
 
+    /// SNI hostname for wss:// connections. When --ws-proxy/--listen target is an IP address,
+    /// --sni overrides the TLS SNI and HTTP Host header to this value.
+    #[structopt(long)]
+    pub sni: Option<String>,
+
     /// A list of IP Addresses to advertise as our external address(s)
     #[structopt(long = "advertise_addresses", use_delimiter = true)]
     pub advertise_addresses: Vec<String>,
@@ -660,6 +676,7 @@ pub struct ConfigFile {
 
     pub ip: Option<String>,
     pub ipv6: Option<String>,
+    pub sni: Option<String>,
     pub advertise_addresses: Option<Vec<String>>,
     pub ifup: Option<String>,
     pub ifdown: Option<String>,
@@ -766,6 +783,7 @@ statsd:
             hooks: HashMap::new(),
             ws_proxy: None,
             ipv6: None,
+            sni: None,
             insecure: None
         }
     )
@@ -818,6 +836,7 @@ fn config_merge() {
         hooks: HashMap::new(),
         ws_proxy: None,
         ipv6: None,
+        sni: None,
         insecure: None,
     });
     assert_eq!(
@@ -828,6 +847,7 @@ fn config_merge() {
             device_path: None,
             ip: None,
             ipv6: None,
+            sni: None,
             advertise_addresses: vec![],
             ifup: Some("ifconfig $IFNAME 10.0.1.1/16 mtu 1400 up".to_string()),
             ifdown: Some("true".to_string()),
@@ -889,6 +909,7 @@ fn config_merge() {
             fix_rp_filter: false,
             ip: None,
             ipv6: None,
+            sni: None,
             advertise_addresses: vec![],
 
             ifup: Some("ifconfig $IFNAME 10.0.1.2/16 mtu 1400 up".to_string()),

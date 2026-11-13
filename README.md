@@ -61,6 +61,22 @@ $> vpncloud --ws-proxy :8080 --password mysecret --ip 10.0.0.1/24
 # UDP listens on 0.0.0.0:8080, WS proxy listens on 0.0.0.0:8080
 ```
 
+### `--sni` (custom TLS SNI / HTTP Host header for wss://)
+
+When connecting to a `wss://` URL whose target is an IP address, the TLS SNI
+and HTTP `Host` header are normally derived from that IP. Use `--sni <host>`
+to override both with a custom hostname:
+
+```sh
+$> vpncloud --ip fd03::3 -l wss://100.101.102.61:8788 -c 100.101.102.61:8788 -p 123 --sni vnetc.swings.one --insecure
+# TCP connects to 100.101.102.61:8788, but TLS SNI and HTTP Host header
+# use "vnetc.swings.one"
+```
+
+This is useful when the network path inspects SNI or when the remote endpoint
+expects a specific `Host` header. Combine with `--insecure` when the remote
+certificate does not match the SNI hostname.
+
 ### `--insecure` (skip TLS certificate verification for wss://)
 
 When connecting to a `wss://` URL, vpnCloud normally verifies the remote

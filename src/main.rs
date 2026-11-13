@@ -418,7 +418,7 @@ fn main() {
     #[cfg(feature = "websocket")]
     if config.listen.starts_with("ws://") || config.listen.starts_with("wss://") {
         let socket = if config.insecure {
-            try_fail!(ProxyConnection::connect(&config.listen, true), "Failed to open socket {}: {}", config.listen)
+            try_fail!(ProxyConnection::connect(&config.listen, config.sni.as_deref(), true), "Failed to open socket {}: {}", config.listen)
         } else {
             try_fail!(ProxyConnection::listen(&config.listen), "Failed to open socket {}: {}", config.listen)
         };

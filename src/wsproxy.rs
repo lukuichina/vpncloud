@@ -161,24 +161,41 @@ pub struct ProxyConnection {
 
 impl ProxyConnection {
     /// Connect to a wss:// URL, optionally skipping TLS certificate verification
-    pub fn connect(url: &str, insecure: bool) -> Result<Self, io::Error> {
+    pub fn connect(url: &str, sni: Option<&str>, insecure: bool) -> Result<Self, io::Error> {
         let parsed_url = io_error!(Url::parse(url), "Invalid URL {}: {}", url)?;
-        let mut socket = if insecure && parsed_url.scheme() == "wss" {
+        let host_str = parsed_url.host_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, format!("No host in URL {}", url))
+        })?;
+        let port = parsed_url.port_or_known_default().unwrap_or(443);
+        let addr = if host_str.contains(':') {
+            format!("[{}]:{}", host_str, port)
+        } else {
+            format!("{}:{}", host_str, port)
+        };
+
+        // When --sni is given, override the URL host so that TLS SNI and HTTP Host header
+        // use the sni value while the underlying TCP connection stays at the original IP.
+        let effective_url = if let Some(sni_val) = sni {
+            let mut modified = parsed_url.clone();
+            modified.set_host(Some(sni_val)).map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, format!("Invalid SNI host {}", sni_val))
+            })?;
+            modified
+        } else {
+            parsed_url
+        };
+
+        let mut socket = if insecure && effective_url.scheme() == "wss" {
             let config = Arc::new(
                 rustls::ClientConfig::builder()
                     .dangerous()
                     .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
                     .with_no_client_auth(),
             );
-            let domain = parsed_url.domain().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, format!("No domain in URL {}", url))
-            })?;
-            let port = parsed_url.port_or_known_default().unwrap_or(443);
-            let addr = format!("{}:{}", domain, port);
             let tcp_stream = TcpStream::connect(&addr)?;
             let connector = Connector::Rustls(config);
             let (ws, _) = client_tls_with_config(
-                parsed_url.as_str(),
+                effective_url.as_str(),
                 tcp_stream,
                 None,
                 Some(connector),
@@ -186,7 +203,7 @@ impl ProxyConnection {
             ws
         } else {
             let (socket, _) = io_error!(
-                tungstenite::connect(parsed_url),
+                tungstenite::connect(effective_url),
                 "Failed to connect to URL {}: {}", url
             )?;
             socket
