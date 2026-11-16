@@ -1,7 +1,10 @@
 use crate::{config::Config, crypto::Crypto, device, types::Mode};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
 use ring::aead;
-use std::{collections::HashMap, fs, io, os::unix::fs::PermissionsExt, path::Path};
+use std::{collections::HashMap, fs, io, path::Path};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 const MODE_SIMPLE: usize = 0;
 const MODE_ADVANCED: usize = 1;
@@ -495,6 +498,7 @@ pub fn configure(name: Option<String>) -> Result<(), dialoguer::Error> {
         let f = fs::File::create(&file)?;
         serde_yaml::to_writer(f, &config_file)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Failed to parse config file"))?;
+        #[cfg(unix)]
         fs::set_permissions(file, fs::Permissions::from_mode(0o600))?;
         println!();
         println!("Use the following commands to control your VPN:");

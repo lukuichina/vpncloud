@@ -33,10 +33,10 @@ pub enum Error {
     SocketIo(&'static str, #[source] io::Error),
 
     #[error("Device error: {0}")]
-    Device(&'static str),
+    Device(String),
 
     #[error("Device error: {0} ({1})")]
-    DeviceIo(&'static str, #[source] io::Error),
+    DeviceIo(String, #[source] io::Error),
 
     #[error("File error: {0}")]
     FileIo(&'static str, #[source] io::Error),

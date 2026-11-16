@@ -91,6 +91,18 @@ impl<TS: TimeSource> ClaimTable<TS> {
         self.housekeep()
     }
 
+    /// Refresh the timeout of all claims belonging to `peer`, keeping them alive
+    /// when traffic flows but no new NodeInfo exchange happens.
+    pub fn refresh_claims_timeout(&mut self, peer: SocketAddr) {
+        let now = TS::now();
+        for entry in &mut self.claims {
+            if entry.peer == peer {
+                entry.timeout = now + self.claim_timeout as Time;
+            }
+        }
+        self.housekeep()
+    }
+
     pub fn lookup(&mut self, addr: Address) -> Option<SocketAddr> {
         // HOT PATH
         if let Some(entry) = self.cache.get(&addr) {

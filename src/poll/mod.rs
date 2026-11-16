@@ -8,8 +8,15 @@ mod epoll;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use self::epoll::EpollWait as WaitImpl;
 
+#[cfg(windows)]
+mod windows_wait;
+
+#[cfg(windows)]
+pub use self::windows_wait::WindowsWait as WaitImpl;
+
 use std::io;
 
+#[derive(Debug)]
 pub enum WaitResult {
     Timeout,
     Socket,

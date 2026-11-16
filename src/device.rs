@@ -10,44 +10,55 @@ use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, Cursor, Error as IoError, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket},
-    os::{unix::io::AsRawFd, fd::RawFd},
     str,
     str::FromStr
 };
 
+#[cfg(unix)]
+use std::os::{unix::io::AsRawFd, fd::RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
+
 use crate::{crypto, error::Error, util::MsgBuffer};
 
-static TUNSETIFF: libc::c_ulong = 1074025674;
+#[cfg(unix)]
+mod unix_ifreq {
+    use super::*;
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct IfReqDataAddr {
-    af: libc::c_int,
-    addr: Ipv4Addr
-}
+    pub static TUNSETIFF: libc::c_ulong = 1074025674;
 
-#[repr(C)]
-union IfReqData {
-    flags: libc::c_short,
-    value: libc::c_int,
-    addr: IfReqDataAddr,
-    _dummy: [u8; 24],
-}
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct IfReqDataAddr {
+        pub af: libc::c_int,
+        pub addr: Ipv4Addr
+    }
 
-#[repr(C)]
-struct IfReq {
-    ifr_name: [u8; libc::IF_NAMESIZE],
-    data: IfReqData,
-}
+    #[repr(C)]
+    pub union IfReqData {
+        pub flags: libc::c_short,
+        pub value: libc::c_int,
+        pub addr: IfReqDataAddr,
+        pub _dummy: [u8; 24],
+    }
 
-impl IfReq {
-    fn new(name: &str) -> Self {
-        assert!(name.len() < libc::IF_NAMESIZE);
-        let mut ifr_name = [0; libc::IF_NAMESIZE];
-        ifr_name[..name.len()].clone_from_slice(name.as_bytes());
-        Self { ifr_name, data: IfReqData { _dummy: [0; 24] } }
+    #[repr(C)]
+    pub struct IfReq {
+        pub ifr_name: [u8; libc::IF_NAMESIZE],
+        pub data: IfReqData,
+    }
+
+    impl IfReq {
+        pub fn new(name: &str) -> Self {
+            assert!(name.len() < libc::IF_NAMESIZE);
+            let mut ifr_name = [0; libc::IF_NAMESIZE];
+            ifr_name[..name.len()].clone_from_slice(name.as_bytes());
+            Self { ifr_name, data: IfReqData { _dummy: [0; 24] } }
+        }
     }
 }
+#[cfg(unix)]
+use unix_ifreq::{IfReq, TUNSETIFF};
 
 /// The type of a tun/tap device
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -81,7 +92,7 @@ impl FromStr for Type {
     }
 }
 
-pub trait Device: AsRawFd {
+pub trait Device {
     /// Returns the type of this device
     fn get_type(&self) -> Type;
 
@@ -89,31 +100,28 @@ pub trait Device: AsRawFd {
     fn ifname(&self) -> &str;
 
     /// Reads a packet/frame from the device
-    ///
-    /// This method reads one packet or frame (depending on the device type) into the `buffer`.
-    /// The `buffer` must be large enough to hold a packet/frame of maximum size, otherwise the
-    /// packet/frame will be split.
-    /// The method will block until a packet/frame is ready to be read.
-    /// On success, the method will return the starting position and the amount of bytes read into
-    /// the buffer.
-    ///
-    /// # Errors
-    /// This method will return an error if the underlying read call fails.
     fn read(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error>;
 
     /// Writes a packet/frame to the device
-    ///
-    /// This method writes one packet or frame (depending on the device type) from `data` to the
-    /// device. The data starts at the position `start` in the buffer. The buffer should have at
-    /// least 4 bytes of space before the start of the packet.
-    /// The method will block until the packet/frame has been written.
-    ///
-    /// # Errors
-    /// This method will return an error if the underlying read call fails.
     fn write(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error>;
 
+    /// Returns the number of packets waiting in the receive channel (0 for non-channel devices).
+    fn pending(&self) -> usize { 0 }
+    /// Channel-mode inbound receiver for low-latency blocking waits in main loop.
+    fn channel_dev_rx(&self) -> Option<&crossbeam_channel::Receiver<Vec<u8>>> { None }
+
     fn get_ip(&self) -> Result<IpAddr, Error>;
+
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> RawFd;
+    #[cfg(windows)]
+    fn as_raw_socket(&self) -> RawSocket;
 }
+
+#[cfg(unix)]
+mod unix_device {
+use super::*;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 /// Represents a tun/tap device
 pub struct TunTapDevice {
@@ -144,12 +152,17 @@ impl TunTapDevice {
     pub fn new(ifname: &str, type_: Type, path: Option<&str>) -> io::Result<Self> {
         let path = path.unwrap_or_else(|| Self::default_path(type_));
         let fd = fs::OpenOptions::new().read(true).write(true).open(path)?;
-        let flags = match type_ {
+        // Set O_NONBLOCK so read() does not block the event loop when no data is available.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags >= 0 {
+            let _ = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+        let tun_flags = match type_ {
             Type::Tun => libc::IFF_TUN | libc::IFF_NO_PI,
             Type::Tap => libc::IFF_TAP | libc::IFF_NO_PI,
         };
         let mut ifreq = IfReq::new(ifname);
-        ifreq.data.flags = flags as libc::c_short;
+        ifreq.data.flags = tun_flags as libc::c_short;
         let res = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF.try_into().unwrap(), &mut ifreq) };
         match res {
             0 => {
@@ -287,26 +300,39 @@ impl Device for TunTapDevice {
     }
 
     fn read(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
+        use std::io::ErrorKind;
         buffer.clear();
-        let read = self.fd.read(buffer.buffer()).map_err(|e| Error::DeviceIo("Read error", e))?;
-        buffer.set_length(read);
-        self.correct_data_after_read(buffer);
-        Ok(())
+        match self.fd.read(buffer.buffer()) {
+            Ok(read) => {
+                buffer.set_length(read);
+                self.correct_data_after_read(buffer);
+                Ok(())
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                Err(Error::Device("empty".to_string()))
+            }
+            Err(e) => Err(Error::DeviceIo("Read error".to_string(), e)),
+        }
     }
 
     fn write(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
         self.correct_data_before_write(buffer);
         match self.fd.write_all(buffer.message()) {
-            Ok(_) => self.fd.flush().map_err(|e| Error::DeviceIo("Flush error", e)),
-            Err(e) => Err(Error::DeviceIo("Write error", e)),
+            Ok(_) => self.fd.flush().map_err(|e| Error::DeviceIo("Flush error".to_string(), e)),
+            Err(e) => Err(Error::DeviceIo("Write error".to_string(), e)),
         }
     }
 
     fn get_ip(&self) -> Result<IpAddr, Error> {
-        get_device_addr(&self.ifname).map_err(|e| Error::DeviceIo("Error getting IP address", e))
+        get_device_addr(&self.ifname).map_err(|e| Error::DeviceIo("Error getting IP address".to_string(), e))
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for TunTapDevice {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
@@ -353,7 +379,7 @@ impl Device for MockDevice {
             buffer.message_mut().copy_from_slice(&data);
             Ok(())
         } else {
-            Err(Error::Device("empty"))
+            Err(Error::Device("empty".to_string()))
         }
     }
 
@@ -363,7 +389,11 @@ impl Device for MockDevice {
     }
 
     fn get_ip(&self) -> Result<IpAddr, Error> {
-        Err(Error::Device("Dummy devices have no IP address"))
+        Err(Error::Device("Dummy devices have no IP address".to_string()))
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        unimplemented!()
     }
 }
 
@@ -373,9 +403,17 @@ impl Default for MockDevice {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for MockDevice {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
+        unimplemented!()
+    }
+}
+
+#[cfg(windows)]
+impl AsRawSocket for MockDevice {
+    fn as_raw_socket(&self) -> RawSocket {
         unimplemented!()
     }
 }
@@ -599,3 +637,448 @@ fn set_rp_filter(device: &str, val: u8) -> io::Result<()> {
     let mut fd = File::create(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", device))?;
     writeln!(fd, "{}", val)
 }
+
+}
+
+#[cfg(unix)]
+pub use unix_device::{TunTapDevice, MockDevice};
+
+#[cfg(windows)]
+mod windows_device {
+    use super::*;
+    use std::os::windows::io::{AsRawSocket, RawSocket};
+    use std::time::{Duration, Instant};
+
+    fn run_command_with_timeout(
+        mut cmd: std::process::Command, timeout: Duration, label: &str,
+    ) -> io::Result<std::process::Output> {
+        use std::io::Read;
+        cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn()?;
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    if let Some(mut o) = child.stdout.take() {
+                        let _ = o.read_to_end(&mut stdout);
+                    }
+                    if let Some(mut e) = child.stderr.take() {
+                        let _ = e.read_to_end(&mut stderr);
+                    }
+                    return Ok(std::process::Output { status, stdout, stderr });
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        warn!("Windows command timed out after {:?}: {}", timeout, label);
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let mut stdout = Vec::new();
+                        let mut stderr = Vec::new();
+                        if let Some(mut o) = child.stdout.take() {
+                            let _ = o.read_to_end(&mut stdout);
+                        }
+                        if let Some(mut e) = child.stderr.take() {
+                            let _ = e.read_to_end(&mut stderr);
+                        }
+                        // On Windows, Command::status().code() can be None for abnormal/terminated processes.
+                        // Use a synthetic exit status-like Output with code inferred as 1 in callers.
+                        return Ok(std::process::Output {
+                            status: status_from_code(1),
+                            stdout,
+                            stderr,
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn status_from_code(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code as u32)
+    }
+
+    /// Minimal TUN-only device for Windows MVP using Wintun.
+    pub struct WintunDevice {
+        ifname: String,
+        type_: Type,
+        session: std::sync::Arc<wintun::Session>,
+        ip: Option<IpAddr>,
+        read_wait_event: windows_sys::Win32::Foundation::HANDLE,
+    }
+
+    impl WintunDevice {
+        pub fn new(ifname: &str, type_: Type, _path: Option<&str>) -> io::Result<Self> {
+            if type_ != Type::Tun {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "Only TUN is supported on Windows MVP"));
+            }
+            // Expand %d placeholder (used on Unix) to a concrete name on Windows.
+            let ifname = if ifname.contains("%d") {
+                ifname.replace("%d", "0")
+            } else {
+                ifname.to_string()
+            };
+            let wintun = unsafe { wintun::load() }
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to load wintun.dll: {}", e)))?;
+            // Try to open existing adapter, otherwise create it. The "name" is the adapter name;
+            // tunnel name can be the same.
+            let adapter = match wintun::Adapter::open(&wintun, &ifname) {
+                Ok(a) => a,
+                Err(_) => wintun::Adapter::create(&wintun, &ifname, &ifname, None)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to create wintun adapter: {}", e)))?,
+            };
+            let session = adapter.start_session(wintun::MAX_RING_CAPACITY)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to start wintun session: {}", e)))?;
+            let session = std::sync::Arc::new(session);
+            let read_wait_event = session.get_read_wait_event()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to get wintun read wait event: {}", e)))?
+                as windows_sys::Win32::Foundation::HANDLE;
+            Ok(Self { ifname, type_, session, ip: None, read_wait_event })
+        }
+
+        pub fn set_mtu(&self, _value: Option<usize>) -> io::Result<()> { Ok(()) }
+        pub fn configure(&mut self, addr: IpAddr, netmask: IpAddr) -> io::Result<()> {
+            // Best-effort: configure via netsh; store IP for get_ip
+            info!("Windows device configure start: ifname={} addr={} netmask={}", self.ifname, addr, netmask);
+            match addr {
+                IpAddr::V4(v4) => {
+                    let mask = match netmask {
+                        IpAddr::V4(m) => m.to_string(),
+                        _ => "255.255.255.0".to_string(),
+                    };
+                    let prefix_len: u32 = match netmask {
+                        IpAddr::V4(m) => m.octets().iter().map(|b| b.count_ones()).sum::<u32>(),
+                        _ => 24,
+                    };
+                    // Bring interface up (best-effort)
+                    let mut enable_cmd = std::process::Command::new("netsh");
+                    enable_cmd.args(["interface", "set", "interface", &format!("name={}", self.ifname), "admin=enabled"]);
+                    match run_command_with_timeout(enable_cmd, Duration::from_secs(8), "netsh interface set admin=enabled") {
+                        Ok(out) => {
+                            info!(
+                                "Windows netsh enable interface status={:?} stdout='{}' stderr='{}'",
+                                out.status.code(),
+                                String::from_utf8_lossy(&out.stdout).trim(),
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            );
+                        }
+                        Err(e) => warn!("Windows netsh enable interface failed: {}", e),
+                    }
+
+                    let mut configured = false;
+                    let attempts: Vec<Vec<String>> = vec![
+                        vec!["interface".into(), "ipv4".into(), "set".into(), "address".into(),
+                             format!("name={}", self.ifname), "static".into(), v4.to_string(), mask.clone()],
+                        vec!["interface".into(), "ipv4".into(), "set".into(), "address".into(),
+                             self.ifname.clone(), "static".into(), v4.to_string(), mask.clone()],
+                        vec!["interface".into(), "ipv4".into(), "add".into(), "address".into(),
+                             format!("name={}", self.ifname), format!("addr={}", v4), format!("mask={}", mask)],
+                        vec!["interface".into(), "ipv4".into(), "add".into(), "address".into(),
+                             self.ifname.clone(), v4.to_string(), mask.clone()],
+                        vec!["interface".into(), "ip".into(), "set".into(), "address".into(),
+                             self.ifname.clone(), "static".into(), v4.to_string(), mask.clone()],
+                    ];
+                    for args in &attempts {
+                        info!("Windows IPv4 config attempt: netsh {:?}", args);
+                        let mut cmd = std::process::Command::new("netsh");
+                        cmd.args(args.iter().map(|s| s.as_str()));
+                        let label = format!("netsh {:?}", args);
+                        match run_command_with_timeout(cmd, Duration::from_secs(10), &label) {
+                            Ok(out) => {
+                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                info!(
+                                    "Windows IPv4 netsh result status={:?} stdout='{}' stderr='{}' args={:?}",
+                                    out.status.code(),
+                                    stdout.trim(),
+                                    stderr.trim(),
+                                    args
+                                );
+                                if out.status.success() {
+                                    configured = true;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Windows IPv4 netsh attempt failed ({:?}): {}", args, e);
+                            }
+                        }
+                    }
+
+                    if !configured {
+                        // PowerShell fallback
+                        let ps = format!(
+                            "$ErrorActionPreference='Continue'; \
+                             Remove-NetIPAddress -InterfaceAlias '{if}' -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue | Out-Null; \
+                             New-NetIPAddress -InterfaceAlias '{if}' -IPAddress '{ip}' -PrefixLength {pfx} -PolicyStore ActiveStore -ErrorAction Stop | Out-Null; \
+                             Start-Sleep -Milliseconds 200; \
+                             $ok = Get-NetIPAddress -InterfaceAlias '{if}' -AddressFamily IPv4 -IPAddress '{ip}' -ErrorAction SilentlyContinue; \
+                             if($ok){{ exit 0 }} else {{ exit 1 }}",
+                            if = self.ifname.replace('\'', "''"),
+                            ip = v4,
+                            pfx = prefix_len
+                        );
+                        info!("Windows IPv4 config PowerShell fallback for {} on {}", v4, self.ifname);
+                        let mut ps_cmd = std::process::Command::new("powershell");
+                        ps_cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps]);
+                        match run_command_with_timeout(ps_cmd, Duration::from_secs(20), "powershell ipv4 fallback") {
+                            Ok(out) => {
+                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                info!(
+                                    "Windows IPv4 PowerShell result status={:?} stdout='{}' stderr='{}'",
+                                    out.status.code(),
+                                    stdout.trim(),
+                                    stderr.trim()
+                                );
+                                if out.status.success() {
+                                    configured = true;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Windows IPv4 PowerShell fallback failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // Post-check (best-effort visibility in logs)
+                    let mut post_cmd = std::process::Command::new("netsh");
+                    post_cmd.args(["interface", "ipv4", "show", "addresses", &format!("name={}", self.ifname)]);
+                    match run_command_with_timeout(post_cmd, Duration::from_secs(8), "netsh show ipv4 addresses") {
+                        Ok(out) => {
+                            info!(
+                                "Windows IPv4 post-check netsh status={:?} stdout='{}' stderr='{}'",
+                                out.status.code(),
+                                String::from_utf8_lossy(&out.stdout).trim(),
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Windows IPv4 post-check netsh failed: {}", e);
+                        }
+                    }
+
+                    if !configured {
+                        warn!("Failed to configure IPv4 {} on interface '{}'; tunnel data-plane may not work until address is set manually", v4, self.ifname);
+                    }
+                }
+                IpAddr::V6(v6) => {
+                    let prefix_len = match netmask {
+                        IpAddr::V6(m) => m.octets().iter().map(|b| b.count_ones() as u8).sum::<u8>(),
+                        _ => 64,
+                    };
+                    let attempts: Vec<Vec<String>> = vec![
+                        vec!["interface".into(), "ipv6".into(), "add".into(), "address".into(),
+                             self.ifname.clone(), format!("{}/{}", v6, prefix_len), "store=active".into()],
+                        vec!["interface".into(), "ipv6".into(), "add".into(), "address".into(),
+                             format!("interface={}", self.ifname), format!("address={}/{}", v6, prefix_len)],
+                        vec!["interface".into(), "ipv6".into(), "set".into(), "address".into(),
+                             format!("interface={}", self.ifname), format!("address={}/{}", v6, prefix_len)],
+                    ];
+                    let mut configured = false;
+                    for args in &attempts {
+                        info!("Windows IPv6 config attempt: netsh {:?}", args);
+                        let mut cmd = std::process::Command::new("netsh");
+                        cmd.args(args.iter().map(|s| s.as_str()));
+                        let label = format!("netsh {:?}", args);
+                        match run_command_with_timeout(cmd, Duration::from_secs(10), &label) {
+                            Ok(out) => {
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                info!("Windows IPv6 netsh result status={:?} stdout='{}' stderr='{}' args={:?}", out.status.code(), stdout.trim(), stderr.trim(), args);
+                                if out.status.success() {
+                                    configured = true;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Windows IPv6 netsh attempt failed ({:?}): {}", args, e);
+                            }
+                        }
+                    }
+                    if !configured {
+                        warn!("Failed to configure IPv6 {}/{} on interface '{}'; tunnel data-plane may not work until address is set manually", v6, prefix_len, self.ifname);
+                    }
+                }
+            }
+            info!("Windows device configure done for ifname={} addr={}", self.ifname, addr);
+            self.ip = Some(addr);
+            Ok(())
+        }
+        pub fn get_rp_filter(&self) -> io::Result<u8> { Ok(1) }
+        pub fn fix_rp_filter(&self) -> io::Result<()> { Ok(()) }
+        pub fn get_overhead(&self) -> usize { 40 + 8 + 16 + 16 + 1 }
+    }
+
+    impl Device for WintunDevice {
+        fn get_type(&self) -> Type { self.type_ }
+        fn ifname(&self) -> &str { &self.ifname }
+        fn read(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::time::Instant;
+            static READ_OK: AtomicU64 = AtomicU64::new(0);
+            static READ_NONE: AtomicU64 = AtomicU64::new(0);
+            static READ_ERR: AtomicU64 = AtomicU64::new(0);
+            static NONE_STREAK: AtomicU64 = AtomicU64::new(0);
+
+            buffer.clear();
+            let t0 = Instant::now();
+            match self.session.try_receive() {
+                Ok(Some(packet)) => {
+                    let bytes = packet.bytes();
+                    let len = bytes.len();
+                    // HOT PATH FILTER: drop IPv6 link-local multicast (ff02::) noise.
+                    // Windows constantly generates IPv6 multicast/SSDP/LLMNR packets on the
+                    // TUN interface. If we let them through, the device stays readable forever
+                    // and starves the socket in the single-threaded event loop.
+                    if len >= 26 && bytes[0] >> 4 == 6 && bytes[24] == 0xff && bytes[25] == 0x02 {
+                        let ok = READ_OK.fetch_add(1, Ordering::Relaxed) + 1;
+                        let us = t0.elapsed().as_micros();
+                        if ok % 100 == 1 {
+                            debug!(
+                                "[TUN_READ] dropped IPv6 multicast packet_len={} read_us={} ok={}",
+                                len, us, ok
+                            );
+                        }
+                        return Err(Error::Device("empty".to_string()));
+                    }
+                    buffer.set_length(len);
+                    buffer.message_mut().copy_from_slice(bytes);
+                    let ok = READ_OK.fetch_add(1, Ordering::Relaxed) + 1;
+                    NONE_STREAK.store(0, Ordering::Relaxed);
+                    let us = t0.elapsed().as_micros();
+                    debug!(
+                        "[TUN_READ] result=Ok packet_len={} read_us={} ok={} none={} err={} none_streak=0",
+                        len,
+                        us,
+                        ok,
+                        READ_NONE.load(Ordering::Relaxed),
+                        READ_ERR.load(Ordering::Relaxed)
+                    );
+                    Ok(())
+                }
+                Ok(None) => {
+                    // Debug mode: non-blocking. Do not wait 50ms inside read; rely on Wintun
+                    // read-wait event re-triggering to avoid starving/blocking the main loop.
+                    let none = READ_NONE.fetch_add(1, Ordering::Relaxed) + 1;
+                    let streak = NONE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+                    let us = t0.elapsed().as_micros();
+                    if none <= 20 || none % 200 == 0 || streak <= 5 || streak % 100 == 0 {
+                        debug!(
+                            "[TUN_READ] result=None(empty) read_us={} ok={} none={} err={} none_streak={} waited_ms=0",
+                            us,
+                            READ_OK.load(Ordering::Relaxed),
+                            none,
+                            READ_ERR.load(Ordering::Relaxed),
+                            streak
+                        );
+                    }
+                    Err(Error::Device("empty".to_string()))
+                }
+                Err(e) => {
+                    let errc = READ_ERR.fetch_add(1, Ordering::Relaxed) + 1;
+                    NONE_STREAK.store(0, Ordering::Relaxed);
+                    let us = t0.elapsed().as_micros();
+                    warn!(
+                        "[TUN_READ] result=Err read_us={} ok={} none={} err={} err={}",
+                        us,
+                        READ_OK.load(Ordering::Relaxed),
+                        READ_NONE.load(Ordering::Relaxed),
+                        errc,
+                        e
+                    );
+                    Err(Error::Device("empty".to_string()))
+                }
+            }
+        }
+        fn write(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::time::Instant;
+            static W_OK: AtomicU64 = AtomicU64::new(0);
+            static W_ERR: AtomicU64 = AtomicU64::new(0);
+            let data = buffer.message();
+            let len = data.len();
+            let icmp = if len >= 28 && (data[0] >> 4) == 4 {
+                let ihl = ((data[0] & 0x0f) as usize) * 4;
+                if len >= ihl + 8 && data.get(9) == Some(&1) {
+                    let b = &data[ihl..];
+                    Some((b[0], b[1], u16::from_be_bytes([b[4], b[5]]), u16::from_be_bytes([b[6], b[7]])))
+                } else { None }
+            } else { None };
+            let t0 = Instant::now();
+            match self.session.allocate_send_packet(len as u16) {
+                Ok(mut packet) => {
+                    let alloc_us = t0.elapsed().as_micros();
+                    packet.bytes_mut().copy_from_slice(data);
+                    self.session.send_packet(packet);
+                    let ok = W_OK.fetch_add(1, Ordering::Relaxed) + 1;
+                    let total_us = t0.elapsed().as_micros();
+                    debug!("[TUN_WRITE] ok len={} alloc_us={} total_us={} ok_count={} err_count={} icmp={:?}", len, alloc_us, total_us, ok, W_ERR.load(Ordering::Relaxed), icmp);
+                    Ok(())
+                }
+                Err(e) => {
+                    let errc = W_ERR.fetch_add(1, Ordering::Relaxed) + 1;
+                    let total_us = t0.elapsed().as_micros();
+                    warn!("[TUN_WRITE] err len={} total_us={} ok_count={} err_count={} icmp={:?} err={:?}", len, total_us, W_OK.load(Ordering::Relaxed), errc, icmp, e);
+                    Err(Error::Device("Wintun write error".to_string()))
+                }
+            }
+        }
+        fn get_ip(&self) -> Result<IpAddr, Error> {
+            self.ip.ok_or(Error::Device("No IP configured".to_string()))
+        }
+        fn as_raw_socket(&self) -> RawSocket { self.read_wait_event as RawSocket }
+    }
+
+    impl AsRawSocket for WintunDevice {
+        fn as_raw_socket(&self) -> RawSocket { self.read_wait_event as RawSocket }
+    }
+// WintunDevice contains a Win32 HANDLE (*mut c_void) which is not automatically Send,
+// but a handle is safe to move between threads as long as it is used with proper
+// synchronization. The Wintun session (Arc) is Send.
+unsafe impl Send for WintunDevice {}
+
+    // MockDevice for Windows
+    pub struct MockDevice {
+        inbound: std::collections::VecDeque<Vec<u8>>,
+        outbound: std::collections::VecDeque<Vec<u8>>,
+    }
+    impl MockDevice {
+        pub fn new() -> Self { Default::default() }
+        pub fn put_inbound(&mut self, data: Vec<u8>) { self.inbound.push_back(data) }
+        pub fn pop_outbound(&mut self) -> Option<Vec<u8>> { self.outbound.pop_front() }
+        pub fn has_inbound(&self) -> bool { !self.inbound.is_empty() }
+    }
+    impl Default for MockDevice {
+        fn default() -> Self { Self { outbound: std::collections::VecDeque::with_capacity(10), inbound: std::collections::VecDeque::with_capacity(10) } }
+    }
+    impl Device for MockDevice {
+        fn get_type(&self) -> Type { Type::Tun }
+        fn ifname(&self) -> &str { "mock0" }
+        fn read(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
+            if let Some(data) = self.inbound.pop_front() {
+                buffer.clear();
+                buffer.set_length(data.len());
+                buffer.message_mut().copy_from_slice(&data);
+                Ok(())
+            } else { Err(Error::Device("empty".to_string())) }
+        }
+        fn write(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
+            self.outbound.push_back(buffer.message().into());
+            Ok(())
+        }
+        fn get_ip(&self) -> Result<IpAddr, Error> { Err(Error::Device("Dummy devices have no IP address".to_string())) }
+        fn as_raw_socket(&self) -> RawSocket { 0 }
+    }
+    impl AsRawSocket for MockDevice {
+        fn as_raw_socket(&self) -> RawSocket { 0 }
+    }
+}
+
+#[cfg(windows)]
+pub use windows_device::{WintunDevice as TunTapDevice, MockDevice};

@@ -13,6 +13,8 @@ use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::Path,
     str::FromStr,
+    thread,
+    time::Duration as StdDuration,
 };
 
 use fnv::FnvHasher;
@@ -42,10 +44,24 @@ use crate::{
 pub type Hash = BuildHasherDefault<FnvHasher>;
 
 const MAX_RECONNECT_INTERVAL: u16 = 3600;
+
+#[inline]
+fn dbg_icmp(payload: &[u8]) -> Option<(u8, u8, u16, u16)> {
+    // IPv4 ICMP echo: type,code,identifier,sequence
+    if payload.len() >= 28 && (payload[0] >> 4) == 4 {
+        let ihl = ((payload[0] & 0x0f) as usize) * 4;
+        if payload.len() >= ihl + 8 && payload.get(9) == Some(&1) {
+            let b = &payload[ihl..];
+            return Some((b[0], b[1], u16::from_be_bytes([b[4], b[5]]), u16::from_be_bytes([b[6], b[7]])));
+        }
+    }
+    None
+}
+
 const RESOLVE_INTERVAL: Time = 300;
 pub const STATS_INTERVAL: Time = 60;
 const OWN_ADDRESS_RESET_INTERVAL: Time = 300;
-const SPACE_BEFORE: usize = 100;
+pub const SPACE_BEFORE: usize = 100;
 
 struct PeerData {
     addrs: AddrList,
@@ -102,6 +118,12 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     pub fn new(
         config: &Config, socket: S, device: D, port_forwarding: Option<PortForwarding>, stats_file: Option<File>,
     ) -> Self {
+        info!("GenericCloud::new: start");
+        if let Ok(local) = socket.address() {
+            info!("GenericCloud::new: socket local/address={}", local);
+        } else {
+            warn!("GenericCloud::new: failed to query socket address");
+        }
         let (learning, broadcast) = match config.mode {
             Mode::Normal => match config.device_type {
                 Type::Tap => (true, true),
@@ -203,12 +225,23 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     #[inline]
     fn send_to(&mut self, addr: SocketAddr, msg: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
-        debug!("Sending msg with {} bytes to {}", msg.len(), addr);
-        self.traffic.count_out_traffic(addr, msg.len());
-        match self.socket.send(msg.message(), addr) {
-            Ok(written) if written == msg.len() => Ok(()),
-            Ok(_) => Err(Error::Socket("Sent out truncated packet")),
-            Err(e) => Err(Error::SocketIo("IOError when sending", e)),
+        let addr_m = crate::net::mapped_addr(addr);
+        let local = self.socket.address().ok();
+        debug!("Sending msg with {} bytes to {} (mapped={}) local={:?}", msg.len(), addr, addr_m, local);
+        self.traffic.count_out_traffic(addr_m, msg.len());
+        match self.socket.send(msg.message(), addr_m) {
+            Ok(written) if written == msg.len() => {
+                debug!("UDP TX ok: {} bytes to {} local={:?}", written, addr_m, local);
+                Ok(())
+            }
+            Ok(written) => {
+                error!("UDP TX truncated: wrote {} of {} bytes to {} local={:?}", written, msg.len(), addr_m, local);
+                Err(Error::Socket("Sent out truncated packet"))
+            }
+            Err(e) => {
+                error!("UDP TX failed to {} local={:?}: {}", addr_m, local, e);
+                Err(Error::SocketIo("IOError when sending", e))
+            }
         }
     }
 
@@ -281,12 +314,16 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     /// # Errors
     /// This method returns `Error::NameError` if the address is a name that fails to resolve.
     pub fn connect<Addr: ToSocketAddrs + fmt::Debug + Clone>(&mut self, addr: Addr) -> Result<(), Error> {
-        let addrs = resolve(&addr)?.into_iter().map(mapped_addr).collect::<SmallVec<[SocketAddr; 3]>>();
-        for addr in &addrs {
-            if self.own_addresses.contains(addr)
-                || self.peers.contains_key(addr)
-                || self.pending_inits.contains_key(addr)
+        let resolved = resolve(&addr)?;
+        info!("Connect target {:?} resolved to {:?}", addr, resolved);
+        let addrs = resolved.into_iter().map(mapped_addr).collect::<SmallVec<[SocketAddr; 3]>>();
+        info!("Connect target {:?} mapped addrs={:?}", addr, addrs);
+        for a in &addrs {
+            if self.own_addresses.contains(a)
+                || self.peers.contains_key(a)
+                || self.pending_inits.contains_key(a)
             {
+                info!("Connect target {:?}: addr {} already known/own/pending, skipping", addr, addr_nice(*a));
                 return Ok(());
             }
         }
@@ -299,6 +336,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         }
         // Send a message to each resolved address
         for a in addrs {
+            info!("Connect target {:?}: initiating handshake to {}", addr, addr_nice(a));
             // Ignore error this time
             self.connect_sock(a).ok();
         }
@@ -330,14 +368,17 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             || self.own_addresses.contains(&addr)
             || self.pending_inits.contains_key(&addr)
         {
+            debug!("connect_sock: {} already connected/own/pending, skipping", addr_nice(addr));
             return Ok(());
         }
-        debug!("Connecting to {:?}", addr);
+        let local = self.socket.address().ok();
+        info!("connect_sock: initiating to {} local={:?}", addr_nice(addr), local);
         let payload = self.create_node_info();
         let mut peer_crypto = self.crypto.peer_instance(payload);
         let mut msg = MsgBuffer::new(SPACE_BEFORE);
         peer_crypto.initialize(&mut msg)?;
         self.pending_inits.insert(addr, peer_crypto);
+        info!("connect_sock: sending init ({} bytes) to {} local={:?}", msg.len(), addr_nice(addr), local);
         self.send_to(addr, &mut msg)
     }
 
@@ -614,15 +655,38 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
 
     pub fn handle_interface_data(&mut self, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
+        let t0 = std::time::Instant::now();
+        // HOT PATH FILTER: drop IPv6 link-local multicast (ff02::) noise at the
+        // interface layer as a second line of defense (device.rs does the same).
+        // Windows constantly generates IPv6 multicast/SSDP/LLMNR packets on the TUN
+        // interface. Dropping them here avoids expensive route lookup + crypto + send
+        // for noise traffic that will never reach a peer.
+        if data.len() >= 26 && data.message()[0] >> 4 == 6 && data.message()[24] == 0xff && data.message()[25] == 0x02 {
+            self.traffic.count_dropped_payload(data.len());
+            return Ok(());
+        }
         let (src, dst) = P::parse(data.message())?;
+        let icmp = dbg_icmp(data.message());
+        let src_s = src.to_string();
+        let dst_s = dst.to_string();
+        if src_s.starts_with("10.99.0.") || dst_s.starts_with("10.99.0.") || icmp.is_some() {
+            debug!("[TUN_RX_PATH] t0 src={}, dst={}, len={}, icmp={:?}", src, dst, data.len(), icmp);
+        }
         debug!("Read data from interface: src: {}, dst: {}, {} bytes", src, dst, data.len());
         self.traffic.count_out_payload(dst, src, data.len());
         match self.table.lookup(dst) {
             Some(addr) => {
                 // HOT PATH
-                // Peer found for destination
                 debug!("Found destination for {} => {}", dst, addr);
+                let t_lookup = t0.elapsed().as_micros();
                 self.send_msg(addr, MESSAGE_TYPE_DATA, data)?;
+                let total_us = t0.elapsed().as_micros();
+                if src_s.starts_with("10.99.0.") || dst_s.starts_with("10.99.0.") || icmp.is_some() {
+                    debug!(
+                        "[TUN_RX_PATH_DONE] src={}, dst={}, peer={}, len_out={}, icmp={:?}, lookup_us={}, send_path_us={}, total_us={}",
+                        src, dst, addr_nice(addr), data.len(), icmp, t_lookup, total_us.saturating_sub(t_lookup), total_us
+                    );
+                }
                 if !self.peers.contains_key(&addr) {
                     // COLD PATH
                     // If the peer is not actually connected, remove the entry in the table and try
@@ -637,6 +701,11 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 if self.broadcast {
                     debug!("No destination for {} found, broadcasting", dst);
                     self.broadcast_msg(MESSAGE_TYPE_DATA, data)?;
+                } else if let Some((fallback_addr, _)) = self.peers.iter().next() {
+                    // Fallback: use the existing peer when route claims have expired,
+                    // preventing traffic drop after peer_timeout without re-handshake.
+                    warn!("No destination for {} found, using fallback peer {}", dst, addr_nice(*fallback_addr));
+                    self.send_msg(*fallback_addr, MESSAGE_TYPE_DATA, data)?;
                 } else {
                     debug!("No destination for {} found, dropping", dst);
                     self.traffic.count_dropped_payload(data.len());
@@ -647,40 +716,86 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     }
 
     fn add_new_peer(&mut self, addr: SocketAddr, info: NodeInfo) -> Result<(), Error> {
-        info!("Added peer {}", addr_nice(addr));
-        self.config.call_hook(
-            "peer_connected",
-            vec![
-                ("PEER", format!("{:?}", addr_nice(addr))),
-                ("IFNAME", self.device.ifname().to_owned()),
-                ("CLAIMS", info.claims.iter().map(|r| format!("{:?}", r)).collect::<Vec<String>>().join(" ")),
-                ("NODE_ID", bytes_to_hex(&info.node_id)),
-            ],
-            true,
-        );
-        if let Some(init) = self.pending_inits.remove(&addr) {
-            self.peers.insert(
-                addr,
-                PeerData {
-                    addrs: info.addrs.clone(),
-                    crypto: init,
-                    node_id: info.node_id,
-                    peer_timeout: info.peer_timeout.unwrap_or(DEFAULT_PEER_TIMEOUT),
-                    last_seen: TS::now(),
-                    timeout: TS::now() + self.config.peer_timeout as Time,
-                },
-            );
-            self.update_peer_info(addr, Some(info))?;
+        // 检查是否已有相同 node_id 的 peer（NAT/SNAT 导致地址变化时）
+        let existing_addr: Option<SocketAddr> = self
+            .peers
+            .iter()
+            .find(|(_, p)| p.node_id == info.node_id)
+            .map(|(a, _)| *a);
+
+        // 在 allow_snat=false 模式下，addr 可能是 SNAT/NAT 地址（消息源地址被中间设备改写），
+        // 不能直接作为 peer key，否则 routing table 中的 claims 会指向错误地址，导致数据包发送失败。
+        // 应使用 info.addrs 中的节点宣称地址（真实监听地址）作为 peer key。
+        let peer_addr = if self.config.allow_snat {
+            addr
         } else {
-            error!("No init for new peer {}", addr_nice(addr));
+            info.addrs.first().copied().unwrap_or(addr)
+        };
+
+        if let Some(existing_addr) = existing_addr {
+            // 同一节点，地址已变（SNAT/NAT），更新现有 peer 而不是创建新的
+            if let Some(peer) = self.peers.get_mut(&existing_addr) {
+                if !peer.addrs.contains(&addr) {
+                    peer.addrs.push(addr);
+                }
+                for new_addr in &info.addrs {
+                    if !peer.addrs.contains(new_addr) {
+                        peer.addrs.push(*new_addr);
+                    }
+                }
+                peer.last_seen = TS::now();
+                peer.timeout = TS::now() + self.config.peer_timeout as Time;
+            }
+            info!(
+                "Updated peer {} (was {}) due to address change",
+                addr_nice(existing_addr),
+                addr_nice(addr)
+            );
+            self.update_peer_info(existing_addr, Some(info))?;
+        } else {
+            info!("Added peer {}", addr_nice(peer_addr));
+            self.config.call_hook(
+                "peer_connected",
+                vec![
+                    ("PEER", format!("{:?}", addr_nice(peer_addr))),
+                    ("IFNAME", self.device.ifname().to_owned()),
+                    ("CLAIMS", info.claims.iter().map(|r| format!("{:?}", r)).collect::<Vec<String>>().join(" ")),
+                    ("NODE_ID", bytes_to_hex(&info.node_id)),
+                ],
+                true,
+            );
+            if let Some(init) = self.pending_inits.remove(&addr) {
+                self.peers.insert(
+                    peer_addr,
+                    PeerData {
+                        addrs: info.addrs.clone(),
+                        crypto: init,
+                        node_id: info.node_id,
+                        peer_timeout: info.peer_timeout.unwrap_or(DEFAULT_PEER_TIMEOUT),
+                        last_seen: TS::now(),
+                        timeout: TS::now() + self.config.peer_timeout as Time,
+                    },
+                );
+                self.update_peer_info(peer_addr, Some(info))?;
+            } else {
+                error!("No init for new peer {}", addr_nice(addr));
+            }
         }
         Ok(())
     }
 
     fn remove_peer(&mut self, addr: SocketAddr) {
-        if let Some(peer) = self.peers.remove(&addr) {
-            info!("Closing connection to {}", addr_nice(addr));
-            self.table.remove_claims(addr);
+        let lookup_addr = if self.config.allow_snat {
+            addr
+        } else {
+            match self.resolve_peer_addr(addr) {
+                Some(a) => a,
+                None => return,
+            }
+        };
+        if let Some(peer) = self.peers.remove(&lookup_addr) {
+            info!("Closing connection to {}", addr_nice(lookup_addr));
+            self.table.remove_claims(lookup_addr);
             self.config.call_hook(
                 "peer_disconnected",
                 vec![
@@ -721,8 +836,47 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         Ok(())
     }
 
+    fn resolve_peer_addr(&self, addr: SocketAddr) -> Option<SocketAddr> {
+        if self.peers.contains_key(&addr) {
+            return Some(addr);
+        }
+        debug!("[RESOLVE_PEER] addr={:?} not found directly, trying conversions", addr);
+        // 尝试 IPv6 映射的 IPv4 <-> 纯 IPv4 地址转换（mapped_addr 可能导致地址族不一致）
+        match addr {
+            SocketAddr::V6(a) => {
+                if let Some(ip4) = a.ip().to_ipv4() {
+                    let alt = SocketAddr::V4(std::net::SocketAddrV4::new(ip4, a.port()));
+                    debug!("[RESOLVE_PEER] trying IPv4 alt={:?}, found={}", alt, self.peers.contains_key(&alt));
+                    if self.peers.contains_key(&alt) {
+                        return Some(alt);
+                    }
+                }
+            }
+            SocketAddr::V4(a) => {
+                let alt = SocketAddr::new(IpAddr::V6(a.ip().to_ipv6_mapped()), a.port());
+                debug!("[RESOLVE_PEER] trying IPv6 alt={:?}, found={}", alt, self.peers.contains_key(&alt));
+                if self.peers.contains_key(&alt) {
+                    return Some(alt);
+                }
+            }
+        }
+        debug!("[RESOLVE_PEER] no match found");
+        None
+    }
+
     fn update_peer_info(&mut self, addr: SocketAddr, info: Option<NodeInfo>) -> Result<(), Error> {
-        if let Some(peer) = self.peers.get_mut(&addr) {
+        let lookup_addr = if self.config.allow_snat {
+            addr
+        } else {
+            match self.resolve_peer_addr(addr) {
+                Some(a) => a,
+                None => {
+                    error!("Received peer update from non peer {}", addr_nice(addr));
+                    return Ok(());
+                }
+            }
+        };
+        if let Some(peer) = self.peers.get_mut(&lookup_addr) {
             peer.last_seen = TS::now();
             peer.timeout = TS::now() + self.config.peer_timeout as Time;
             if let Some(info) = &info {
@@ -735,14 +889,11 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     }
                 }
             }
-        } else {
-            error!("Received peer update from non peer {}", addr_nice(addr));
-            return Ok(());
         }
         if let Some(info) = info {
-            debug!("Adding claims of peer {}: {:?}", addr_nice(addr), info.claims);
-            self.table.set_claims(addr, info.claims);
-            debug!("Received {} peers from {}: {:?}", info.peers.len(), addr_nice(addr), info.peers);
+            debug!("Adding claims of peer {}: {:?}", addr_nice(lookup_addr), info.claims);
+            self.table.set_claims(lookup_addr, info.claims);
+            debug!("Received {} peers from {}: {:?}", info.peers.len(), addr_nice(lookup_addr), info.peers);
             self.connect_to_peers(&info.peers)?;
         }
         Ok(())
@@ -750,19 +901,37 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
 
     fn handle_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
+        let t0 = std::time::Instant::now();
         let (src, dst) = P::parse(data.message())?;
         let len = data.len();
-        debug!("Writing data to device: {} bytes", len);
+        let icmp = dbg_icmp(data.message());
+        debug!("[TUN_WRITE_PATH] start: {} bytes, inner src={}, dst={}, peer={}, icmp={:?}", len, src, dst, addr_nice(peer), icmp);
         self.traffic.count_in_payload(src, dst, len);
-        if let Err(e) = self.device.write(data) {
-            error!("Failed to send via device: {}", e);
-            return Err(e);
+        let t_parse = t0.elapsed().as_micros();
+        match self.device.write(data) {
+            Ok(()) => {
+                let total_us = t0.elapsed().as_micros();
+                debug!(
+                    "[TUN_WRITE_PATH_DONE] ok: {} bytes, inner src={}, dst={}, peer={}, icmp={:?}, parse_us={}, write_us={}, total_us={}",
+                    len, src, dst, addr_nice(peer), icmp, t_parse, total_us.saturating_sub(t_parse), total_us
+                );
+                if self.learning {
+                    self.table.cache(src, peer);
+                }
+                // Refresh claim timeout so routes stay alive while traffic flows,
+                // even without periodic NodeInfo re-exchange.
+                self.table.refresh_claims_timeout(peer);
+                Ok(())
+            }
+            Err(e) => {
+                let total_us = t0.elapsed().as_micros();
+                error!(
+                    "[TUN_WRITE_PATH] failed: {} bytes, inner src={}, dst={}, peer={}, icmp={:?}, total_us={}, err={}",
+                    len, src, dst, addr_nice(peer), icmp, total_us, e
+                );
+                Err(e)
+            }
         }
-        if self.learning {
-            // Learn single address
-            self.table.cache(src, peer);
-        }
-        Ok(())
     }
 
     fn handle_message(
@@ -772,6 +941,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         match msg_result {
             MessageResult::Message(type_) => {
                 // HOT PATH
+                debug!("Decrypted/app message from {}: type={}", addr_nice(src), type_);
                 match type_ {
                     MESSAGE_TYPE_DATA => {
                         // HOT PATH
@@ -826,21 +996,90 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     pub fn handle_net_message(&mut self, src: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         let src = mapped_addr(src);
+        let mut effective_src = src;
         debug!("Received {} bytes from {}", data.len(), src);
         let msg_result = if let Some(init) = self.pending_inits.get_mut(&src) {
             // COLD PATH
+            debug!("Dispatch: using pending init state for {}", addr_nice(src));
             init.handle_message(data)
         } else if is_init_message(data.message()) {
             // COLD PATH
+            debug!("Dispatch: init message from {}", addr_nice(src));
             let mut result = None;
+            let mut ignore_duplicate_init = false;
             if let Some(peer) = self.peers.get_mut(&src) {
+                effective_src = src;
                 if peer.crypto.has_init() {
+                    debug!("Dispatch: existing peer {} has crypto init, reusing it", addr_nice(src));
                     result = Some(peer.crypto.handle_message(data))
+                } else if peer.crypto.is_ready() {
+                    debug!("Dispatch: existing ready peer {} has no init state; ignoring duplicate/late init message", addr_nice(src));
+                    ignore_duplicate_init = true;
+                } else {
+                    debug!("Dispatch: existing peer {} has no crypto init and not ready", addr_nice(src));
                 }
+            }
+            // When allow_snat is false, try SNAT/NAT address change handling during
+            // handshake/init window: accept the currently observed transport source as a
+            // legitimate initial endpoint (NAT/SNAT rewrite) and make replies follow src.
+            // This does NOT permit arbitrary drift after an established session.
+            if result.is_none() && !ignore_duplicate_init && !self.config.allow_snat {
+                // Pending inits: try to match by crypto state. On match, rebind the init
+                // entry to the observed src so all subsequent replies follow the real path.
+                let mut pending_match: Option<(SocketAddr, MessageResult<NodeInfo>, MsgBuffer)> = None;
+                for (addr, init) in self.pending_inits.iter_mut() {
+                    let mut test = data.clone();
+                    if let Ok(msg_result) = init.handle_message(&mut test) {
+                        pending_match = Some((*addr, msg_result, test));
+                        break;
+                    }
+                }
+                if let Some((matched_addr, msg_result, mut decrypted_data)) = pending_match {
+                    if matched_addr != src {
+                        debug!(
+                            "SNAT/NAT handshake rebind for pending init: {} -> {}",
+                            addr_nice(matched_addr),
+                            addr_nice(src)
+                        );
+                        if let Some(init) = self.pending_inits.remove(&matched_addr) {
+                            self.pending_inits.insert(src, init);
+                        }
+                    }
+                    effective_src = src;
+                    self.handle_message(src, msg_result, &mut decrypted_data)?;
+                    return Ok(());
+                }
+                // Existing peer still in init/handshake state: reply to observed src during init window.
+                for (addr, peer) in self.peers.iter_mut() {
+                    if peer.crypto.has_init() {
+                        let mut test = data.clone();
+                        if let Ok(msg_result) = peer.crypto.handle_message(&mut test) {
+                            if *addr != src {
+                                debug!(
+                                    "SNAT/NAT handshake endpoint for peer init: {} observed at {}",
+                                    addr_nice(*addr),
+                                    addr_nice(src)
+                                );
+                                if !peer.addrs.contains(&src) {
+                                    peer.addrs.push(src);
+                                }
+                                peer.last_seen = TS::now();
+                                peer.timeout = TS::now() + self.config.peer_timeout as Time;
+                            }
+                            effective_src = src;
+                            self.handle_message(src, msg_result, &mut test)?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if ignore_duplicate_init {
+                return Ok(());
             }
             if let Some(result) = result {
                 result
             } else {
+                debug!("Dispatch: creating new pending init for {}", addr_nice(src));
                 let mut init = self.crypto.peer_instance(self.create_node_info());
                 let msg_result = init.handle_message(data);
                 match msg_result {
@@ -854,19 +1093,78 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                             true,
                         );
                         self.pending_inits.insert(src, init);
+                        debug!("Dispatch: inserted pending init for {}", addr_nice(src));
                         Ok(res)
                     }
                     Err(err) => {
+                        debug!("Dispatch: new pending init failed for {}: {}", addr_nice(src), err);
                         self.traffic.count_invalid_protocol(data.len());
                         return Err(err);
                     }
                 }
             }
-        } else if let Some(peer) = self.peers.get_mut(&src) {
-            // HOT PATH
-            peer.crypto.handle_message(data)
+        } else if let Some(peer) = if self.config.allow_snat {
+            self.peers.get_mut(&src)
         } else {
-            // COLD PATH
+            self.resolve_peer_addr(src).and_then(|a| self.peers.get_mut(&a))
+        } {
+            // HOT PATH
+            let ready = peer.crypto.is_ready();
+            if !ready {
+                debug!("Peer {} exists but crypto not ready yet; processing message as existing peer", addr_nice(src));
+            } else {
+                debug!("Dispatch: existing ready peer {} handling non-init message", addr_nice(src));
+            }
+            peer.crypto.handle_message(data)
+        } else if !self.config.allow_snat {
+            // COLD PATH - SNAT/NAT 地址变化：尝试用已知 peer 的 crypto 解密。
+            // 对每个 peer/pending_init 先用 data.clone() 试解密，成功后用解密后的数据处理，
+            // 避免 handle_message 两次推进 crypto 状态导致握手/解密失败。
+            // 不提前从 pending_inits 移除 init，由 add_new_peer 在握手完成后统一移除。
+            let mut matched: Option<(SocketAddr, MessageResult<NodeInfo>, MsgBuffer, bool)> = None;
+            for (addr, peer) in self.peers.iter_mut() {
+                let mut test = data.clone();
+                if let Ok(msg_result) = peer.crypto.handle_message(&mut test) {
+                    matched = Some((*addr, msg_result, test, false));
+                    break;
+                }
+            }
+            if matched.is_none() {
+                for (addr, init) in self.pending_inits.iter_mut() {
+                    let mut test = data.clone();
+                    if let Ok(msg_result) = init.handle_message(&mut test) {
+                        matched = Some((*addr, msg_result, test, true));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((matched_addr, msg_result, mut decrypted_data, is_pending)) = matched {
+                info!(
+                    "SNAT/NAT address change: peer {} now at {}",
+                    addr_nice(matched_addr),
+                    addr_nice(src)
+                );
+                if is_pending {
+                    // pending_inits 中的条目：不在此处移除，由 add_new_peer 在握手完成时移除
+                    // 仅更新 last_seen（pending_inits 无 last_seen 字段，跳过）
+                } else if let Some(peer) = self.peers.get_mut(&matched_addr) {
+                    if !peer.addrs.contains(&src) {
+                        peer.addrs.push(src);
+                    }
+                    peer.last_seen = TS::now();
+                    peer.timeout = TS::now() + self.config.peer_timeout as Time;
+                }
+                self.handle_message(matched_addr, msg_result, &mut decrypted_data)?;
+                Ok(MessageResult::None)
+            } else {
+                // COLD PATH
+                info!("Ignoring non-init message from unknown peer {}", addr_nice(src));
+                self.traffic.count_invalid_protocol(data.len());
+                return Ok(());
+            }
+        } else {
+            // COLD PATH - allow_snat is true, ignore unknown peer
             info!("Ignoring non-init message from unknown peer {}", addr_nice(src));
             self.traffic.count_invalid_protocol(data.len());
             return Ok(());
@@ -875,7 +1173,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         match msg_result {
             Ok(val) => {
                 // HOT PATH
-                self.handle_message(src, val, data)
+                self.handle_message(effective_src, val, data)
             }
             Err(err) => {
                 // COLD PATH
@@ -891,61 +1189,343 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         }
     }
 
-    fn handle_socket_event(&mut self, buffer: &mut MsgBuffer) {
+    fn handle_socket_event(&mut self, buffer: &mut MsgBuffer, first: Option<crate::channel_io::NetPacket>) -> bool {
         // HOT PATH
-        let src = try_fail!(self.socket.receive(buffer), "Failed to read from network socket: {}");
-        self.traffic.count_in_traffic(src, buffer.len());
-        match self.handle_net_message(src, buffer) {
-            Err(e @ Error::CryptoInitFatal(_)) => {
-                // COLD PATH
-                debug!("Fatal crypto init error from {}: {}", src, e);
-                info!("Closing pending connection to {} due to error in crypto init", addr_nice(src));
-                self.pending_inits.remove(&src);
-                self.config.call_hook(
-                    "peer_disconnected",
-                    vec![("PEER", format!("{:?}", addr_nice(src))), ("IFNAME", self.device.ifname().to_owned())],
-                    true,
+        let socket_pending = self.socket.pending();
+        if socket_pending > 100 {
+            warn!("[CLOUD] socket channel backlog={} packets (bufferbloat risk)", socket_pending);
+        }
+        let t_ev = std::time::Instant::now();
+        let mut drained_packets: u64 = 0;
+        let mut drained_bytes: usize = 0;
+        let mut first_pkt = first;
+
+        loop {
+            let src = if let Some(pkt) = first_pkt.take() {
+                buffer.clear();
+                buffer.clone_from(&pkt.data);
+                pkt.addr
+            } else {
+                match self.socket.receive(buffer) {
+                    Ok(src) => src,
+                    Err(e) => {
+                    #[cfg(windows)]
+                    {
+                        use std::io::ErrorKind;
+                        if e.kind() == ErrorKind::WouldBlock {
+                            // WSAEWOULDBLOCK / channel empty - no more data, drain done
+                            return drained_packets > 0;
+                        }
+                        // On Windows UDP sockets, recvfrom may report prior ICMP errors (e.g. port
+                        // unreachable) as WSAECONNRESET(10054)/WSAECONNREFUSED(10061). Treat as
+                        // transient/non-fatal so we keep processing future packets.
+                        if let Some(code) = e.raw_os_error() {
+                            if code == 10054 || code == 10061 {
+                                warn!("Transient UDP recv error (os error {}), likely ICMP unreachable/refused for a previous send; continuing: {}", code, e);
+                                return drained_packets > 0;
+                            }
+                            if code == 10035 {
+                                // WSAEWOULDBLOCK - no more data, drain done
+                                return drained_packets > 0;
+                            }
+                        }
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::io::ErrorKind;
+                        if e.kind() == ErrorKind::WouldBlock {
+                            // EAGAIN/EWOULDBLOCK - no more data, drain done
+                            return drained_packets > 0;
+                        }
+                    }
+                    error!("Failed to read from network socket: {}", e);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    return drained_packets > 0;
+                }
+            }
+            };
+
+            drained_packets += 1;
+            drained_bytes += buffer.len();
+
+            self.traffic.count_in_traffic(src, buffer.len());
+            let raw = src;
+            let src = crate::net::mapped_addr(src);
+            let len = buffer.len();
+            debug!("UDP RX raw: {} bytes from {} (mapped={})", len, raw, src);
+            if len == 0 {
+                debug!("UDP RX empty datagram from {}, ignoring", src);
+                continue;
+            }
+            let t_before_handle = t_ev.elapsed().as_micros();
+            match self.handle_net_message(src, buffer) {
+                Err(e @ Error::CryptoInitFatal(_)) => {
+                    // COLD PATH
+                    debug!("Fatal crypto init error from {}: {}", src, e);
+                    info!("Closing pending connection to {} due to error in crypto init", addr_nice(src));
+                    self.pending_inits.remove(&src);
+                    self.config.call_hook(
+                        "peer_disconnected",
+                        vec![("PEER", format!("{:?}", addr_nice(src))), ("IFNAME", self.device.ifname().to_owned())],
+                        true,
+                    );
+                    debug!("[SOCKET_EVT] src={} len={} recv_us={} total_us={} result=crypto_init_fatal", src, len, t_before_handle, t_ev.elapsed().as_micros());
+                }
+                Err(e @ Error::CryptoInit(_)) => {
+                    // COLD PATH
+                    debug!("Recoverable init error from {}: {}", src, e);
+                    info!("Ignoring invalid init message from peer {}", addr_nice(src));
+                    debug!("[SOCKET_EVT] src={} len={} recv_us={} total_us={} result=crypto_init", src, len, t_before_handle, t_ev.elapsed().as_micros());
+                }
+                Err(e @ Error::Crypto(_)) => {
+                    // COLD PATH
+                    error!("Crypto error from {}: {}", src, e);
+                    debug!("[SOCKET_EVT] src={} len={} recv_us={} total_us={} result=crypto_err", src, len, t_before_handle, t_ev.elapsed().as_micros());
+                }
+                Err(e) => {
+                    // COLD PATH
+                    error!("handle_net_message error from {}: {}", src, e);
+                    debug!("[SOCKET_EVT] src={} len={} recv_us={} total_us={} result=err", src, len, t_before_handle, t_ev.elapsed().as_micros());
+                }
+                Ok(_) => {
+                    let total_us = t_ev.elapsed().as_micros();
+                    let handle_us = total_us.saturating_sub(t_before_handle);
+                    debug!("[SOCKET_EVT] src={} len={} recv_us={} handle_us={} total_us={} result=ok", src, len, t_before_handle, handle_us, total_us);
+                    if handle_us >= 10_000 || total_us >= 15_000 {
+                        warn!(
+                            "[SOCKET_EVT_SLOW] src={} len={} recv_us={} handle_us={} total_us={}",
+                            src, len, t_before_handle, handle_us, total_us
+                        );
+                    }
+                }
+            }
+
+            // Safety bound: avoid monopolizing the single-threaded loop when socket is very busy.
+            if drained_packets >= 64 || t_ev.elapsed().as_micros() >= 20_000 {
+                warn!(
+                    "[SOCKET_EVT_DRAIN] break early drained_packets={} drained_bytes={} total_us={}",
+                    drained_packets, drained_bytes, t_ev.elapsed().as_micros()
                 );
+                return true;
             }
-            Err(e @ Error::CryptoInit(_)) => {
-                // COLD PATH
-                debug!("Recoverable init error from {}: {}", src, e);
-                info!("Ignoring invalid init message from peer {}", addr_nice(src));
-            }
-            Err(e) => {
-                // COLD PATH
-                error!("{}", e);
-            }
-            Ok(_) => {} // HOT PATH
         }
     }
 
-    fn handle_device_event(&mut self, buffer: &mut MsgBuffer) {
+    fn handle_device_event(&mut self, buffer: &mut MsgBuffer, first: Option<Vec<u8>>) -> bool {
         // HOT PATH
-        try_fail!(self.device.read(buffer), "Failed to read from device: {}");
-        if let Err(e) = self.handle_interface_data(buffer) {
-            error!("{}", e);
+        let device_pending = self.device.pending();
+        if device_pending > 100 {
+            warn!("[CLOUD] device channel backlog={} packets (bufferbloat risk)", device_pending);
+        }
+        let t_evt = std::time::Instant::now();
+        let mut drained_packets: u64 = 0;
+        let mut drained_bytes: usize = 0;
+        let mut first_data = first;
+
+        loop {
+            let t_read = std::time::Instant::now();
+            let (read_result, read_us) = if let Some(data) = first_data.take() {
+                buffer.clear();
+                buffer.clone_from(&data);
+                (Ok(()), 0u128)
+            } else {
+                let rr = self.device.read(buffer);
+                let rus = t_read.elapsed().as_micros();
+                if rus > 10_000 {
+                    warn!("[DEVICE_READ_SLOW] read_us={}", rus);
+                }
+                (rr, rus)
+            };
+
+            match read_result {
+                Ok(_) => {
+                    let len = buffer.len();
+                    debug!("[TUN_READ] len={} read_us={}", len, read_us);
+                    let t_handle = std::time::Instant::now();
+                    if let Err(e) = self.handle_interface_data(buffer) {
+                        error!("{}", e);
+                    }
+                    let handle_us = t_handle.elapsed().as_micros();
+                    drained_packets += 1;
+                    drained_bytes += len;
+
+                    let total_us = t_evt.elapsed().as_micros();
+                    if drained_packets == 1 || drained_packets % 32 == 0 || total_us >= 10_000 {
+                        debug!(
+                            "[DEVICE_EVT_DRAIN] seq={} len={} read_us={} handle_us={} total_us={} drained_packets={} drained_bytes={}",
+                            drained_packets, len, read_us, handle_us, total_us, drained_packets, drained_bytes
+                        );
+                    }
+
+                    // Safety bound: avoid monopolizing the main loop when TUN is very busy.
+                    if drained_packets >= 64 || total_us >= 20_000 {
+                        warn!(
+                            "[DEVICE_EVT_DRAIN] break early drained_packets={} drained_bytes={} total_us={}",
+                            drained_packets, drained_bytes, total_us
+                        );
+                        return true;
+                    }
+                }
+                Err(Error::Device(ref msg)) if msg == "empty" => {
+                    return drained_packets > 0;
+                }
+                Err(e) => {
+                    let total_us = t_evt.elapsed().as_micros();
+                    error!("Failed to read from device: {}", e);
+                    debug!(
+                        "[DEVICE_EVT] result=err drained_packets={} drained_bytes={} total_us={}",
+                        drained_packets, drained_bytes, total_us
+                    );
+                    return drained_packets > 0;
+                }
+            }
         }
     }
 
     /// The main method of the node
     ///
-    /// This method will use epoll to wait in the sockets and the device at the same time.
-    /// It will read from the sockets, decode and decrypt the message and then call the
-    /// `handle_net_message` method. It will also read from the device and call
-    /// `handle_interface_data` for each packet read.
-    /// Also, this method will call `housekeep` every second.
+    /// This method runs the dual-thread main loop:
+    /// - The net thread owns the real UDP socket and drains packets into a channel.
+    /// - The device thread owns the real TUN/Wintun device and drains packets into a channel.
+    /// - This main thread drains both channels, runs crypto/routing/housekeep,
+    ///   and sends outbound packets back through the channels.
+    ///
+    /// This replaces the old single-threaded mutex event loop where socket and device
+    /// contended for the same select()/epoll_wait(), which caused socket starvation
+    /// on Windows when the TUN device was continuously readable (IPv6 multicast etc.).
     pub fn run(&mut self) {
+        info!("Cloud::run: starting, ifname={}", self.device.ifname());
         let ctrlc = CtrlC::new();
+        let poll_timeout_ms = self.config.poll_timeout_ms;
+        info!("Cloud::run: poll wait timeout = {} ms", poll_timeout_ms);
+        info!("Cloud::run: entering channel-based dual-thread main loop");
+        let mut buffer = MsgBuffer::new(SPACE_BEFORE);
+        let mut event_count: u64 = 0;
+        let mut last_event_ts = TS::now();
+        self.config.call_hook("vpn_started", vec![("IFNAME", self.device.ifname())], true);
+        loop {
+            // HOT PATH
+            event_count += 1;
+            let now_ts = TS::now();
+            let since_last_ms = (now_ts - last_event_ts) as i64;
+            // When poll_timeout_ms==0 the loop can spin very fast; avoid periodic count-based
+            // debug logs that flood logs. Keep early samples and gap-based diagnostics.
+            let periodic = if poll_timeout_ms == 0 { event_count % 200000 == 0 } else { event_count % 200 == 0 };
+            if event_count <= 50 || periodic || since_last_ms >= 50 {
+                debug!("Cloud::run: event #{} since_last_ms={}", event_count, since_last_ms);
+            }
+            if since_last_ms >= 500 {
+                warn!("Cloud::run: long gap between loop iterations event #{} since_last_ms={}", event_count, since_last_ms);
+            }
+            last_event_ts = now_ts;
+
+            // Drain all available network/device packets.
+            let socket_drained = self.handle_socket_event(&mut buffer, None);
+            let device_drained = self.handle_device_event(&mut buffer, None);
+
+            if !socket_drained && !device_drained {
+                // Zero-consumption idle wait: block on channel events and process the received item
+                // immediately (do not drop it), then drain remaining packets.
+                let now = TS::now();
+                if self.next_housekeep <= now {
+                    if ctrlc.was_pressed() { break; }
+                    if let Err(e) = self.housekeep() { error!("{}", e) }
+                    self.next_housekeep = TS::now() + 1;
+                    continue;
+                }
+                let until_housekeep_ms = ((self.next_housekeep - now) as u64).saturating_mul(1000).max(1);
+                let idle_ms = if poll_timeout_ms == 0 { 1 } else { poll_timeout_ms as u64 };
+                let wait_ms = idle_ms.min(until_housekeep_ms).min(200);
+                if let (Some(nrx), Some(drx)) = (self.socket.channel_net_rx(), self.device.channel_dev_rx()) {
+                    crossbeam_channel::select! {
+                        recv(nrx) -> msg => {
+                            if let Ok(pkt) = msg {
+                                self.handle_socket_event(&mut buffer, Some(pkt));
+                                self.handle_device_event(&mut buffer, None);
+                            }
+                        },
+                        recv(drx) -> msg => {
+                            if let Ok(data) = msg {
+                                self.handle_device_event(&mut buffer, Some(data));
+                                self.handle_socket_event(&mut buffer, None);
+                            }
+                        },
+                        default(std::time::Duration::from_millis(wait_ms)) => {},
+                    }
+                } else {
+                    thread::sleep(StdDuration::from_millis(wait_ms));
+                }
+                // loop again to honor housekeep/ctrlc and continue draining
+                if self.next_housekeep < TS::now() {
+                    if ctrlc.was_pressed() { break; }
+                    if let Err(e) = self.housekeep() { error!("{}", e) }
+                    self.next_housekeep = TS::now() + 1;
+                }
+                continue;
+            }
+
+            if self.next_housekeep < TS::now() {
+                // COLD PATH
+                if ctrlc.was_pressed() {
+                    break;
+                }
+                if let Err(e) = self.housekeep() {
+                    error!("{}", e)
+                }
+                self.next_housekeep = TS::now() + 1
+            }
+        }
+        info!("Shutting down...");
+        self.config.call_hook("vpn_shutdown", vec![("IFNAME", self.device.ifname())], true);
+        buffer.clear();
+        self.broadcast_msg(MESSAGE_TYPE_CLOSE, &mut buffer).ok();
+        if let Some(ref path) = self.config.beacon_store {
+            let path = Path::new(path);
+            if path.exists() {
+                info!("Removing beacon file");
+                if let Err(e) = fs::remove_file(path) {
+                    error!("Failed to remove beacon file: {}", e)
+                }
+            }
+        }
+    }
+
+    /// Single-threaded event loop using WaitImpl (epoll/WSAEvent+WFMO).
+    /// Used as the native fast path (direct nonblocking UDP socket + TUN/Wintun)
+    /// and as the fallback path for websocket-proxy connections.
+    pub fn run_legacy(&mut self) {
+        info!("Cloud::run_legacy: starting single-thread event loop, ifname={}", self.device.ifname());
+        let ctrlc = CtrlC::new();
+        let poll_timeout_ms = self.config.poll_timeout_ms;
+        info!("Cloud::run_legacy: wait timeout = {} ms", poll_timeout_ms);
+        #[cfg(unix)]
         let waiter = try_fail!(
-            WaitImpl::new(self.socket.as_raw_fd(), self.device.as_raw_fd(), 1000),
+            WaitImpl::new(self.socket.as_raw_fd(), self.device.as_raw_fd(), poll_timeout_ms),
             "Failed to setup poll: {}"
         );
+        #[cfg(windows)]
+        let waiter = try_fail!(
+            WaitImpl::new(self.socket.as_raw_socket(), self.device.as_raw_socket(), poll_timeout_ms),
+            "Failed to setup poll: {}"
+        );
+        info!("Cloud::run_legacy: poll/waiter initialized, entering main loop");
         let mut buffer = MsgBuffer::new(SPACE_BEFORE);
         let mut poll_error = false;
+        let mut event_count: u64 = 0;
+        let mut last_event_ts = TS::now();
         self.config.call_hook("vpn_started", vec![("IFNAME", self.device.ifname())], true);
         for evt in waiter {
             // HOT PATH
+            event_count += 1;
+            let now_ts = TS::now();
+            let since_last_ms = (now_ts - last_event_ts) as i64;
+            if event_count <= 50 || event_count % 200 == 0 || since_last_ms >= 50 {
+                debug!("Cloud::run_legacy: event #{} {:?} since_last_ms={}", event_count, evt, since_last_ms);
+            }
+            if since_last_ms >= 500 {
+                warn!("Cloud::run_legacy: long gap between loop iterations event #{} {:?} since_last_ms={}", event_count, evt, since_last_ms);
+            }
+            last_event_ts = now_ts;
             match evt {
                 WaitResult::Error(err) => {
                     // COLD PATH
@@ -956,8 +1536,12 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     poll_error = true;
                 }
                 WaitResult::Timeout => {}
-                WaitResult::Socket => self.handle_socket_event(&mut buffer),
-                WaitResult::Device => self.handle_device_event(&mut buffer),
+                WaitResult::Socket => {
+                    self.handle_socket_event(&mut buffer, None);
+                }
+                WaitResult::Device => {
+                    self.handle_device_event(&mut buffer, None);
+                }
             }
             if self.next_housekeep < TS::now() {
                 // COLD PATH
@@ -1006,12 +1590,12 @@ impl<P: Protocol> GenericCloud<MockDevice, P, MockSocket, MockTimeSource> {
 
     pub fn trigger_socket_event(&mut self) {
         let mut buffer = MsgBuffer::new(SPACE_BEFORE);
-        self.handle_socket_event(&mut buffer);
+        self.handle_socket_event(&mut buffer, None);
     }
 
     pub fn trigger_device_event(&mut self) {
         let mut buffer = MsgBuffer::new(SPACE_BEFORE);
-        self.handle_device_event(&mut buffer);
+        self.handle_device_event(&mut buffer, None);
     }
 
     pub fn trigger_housekeep(&mut self) {

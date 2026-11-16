@@ -11,8 +11,8 @@ use std::{
 
 use crate::error::Error;
 
-#[cfg(not(target_os = "linux"))]
-use time;
+#[cfg(all(unix, not(target_os = "linux")))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use signal::{trap::Trap, Signal};
@@ -329,9 +329,20 @@ impl TimeSource for SystemTimeSource {
         tv.tv_sec as Time
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn now() -> Time {
-        time::get_time().sec
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as Time
+    }
+
+    #[cfg(windows)]
+    fn now() -> Time {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as Time
     }
 }
 

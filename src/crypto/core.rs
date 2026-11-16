@@ -177,13 +177,15 @@ impl CryptoCore {
 
     fn decrypt_with_key(key: &mut CryptoKey, nonce: Nonce, data_and_tag: &mut [u8]) -> Result<(), Error> {
         if nonce < key.min_nonce {
+            debug!("Decrypt rejected: old nonce");
             return Err(Error::Crypto("Old nonce rejected"));
         }
         // decrypt
         let crypto_nonce = aead::Nonce::assume_unique_for_key(*nonce.as_bytes());
-        key.key
-            .open_in_place(crypto_nonce, aead::Aad::empty(), data_and_tag)
-            .map_err(|_| Error::Crypto("Failed to decrypt data"))?;
+        key.key.open_in_place(crypto_nonce, aead::Aad::empty(), data_and_tag).map_err(|_| {
+            debug!("Decrypt failed: auth/tag mismatch or wrong key");
+            Error::Crypto("Failed to decrypt data")
+        })?;
         // last seen nonce
         if key.seen_nonce < nonce {
             key.seen_nonce = nonce;
@@ -193,6 +195,7 @@ impl CryptoCore {
 
     pub fn decrypt(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
         assert!(buffer.len() >= EXTRA_LEN + TAG_LEN);
+        let orig_len = buffer.len();
         let (extra, data_and_tag) = buffer.message_mut().split_at_mut(EXTRA_LEN);
         let key_id;
         let mut nonce;
@@ -203,6 +206,8 @@ impl CryptoCore {
             extra.read_exact(&mut nonce.0[5..]).map_err(|_| Error::Crypto("Input data too short"))?;
             nonce.set_msb(if self.nonce_half { 0x00 } else { 0x80 });
         }
+        // Verbose per-packet decrypt logging disabled: floods startup benchmarks/runtime.
+        // debug!("Decrypt attempt: key_id={}, nonce_msb={}, len={}, current_key={}", key_id, if self.nonce_half { 0x00u8 } else { 0x80u8 }, orig_len, self.current_key);
         let key = &mut self.keys[key_id as usize];
         let result = Self::decrypt_with_key(key, nonce, data_and_tag);
         buffer.set_start(buffer.get_start() + EXTRA_LEN);
@@ -215,7 +220,8 @@ impl CryptoCore {
         let id = (id % 4) as usize;
         self.keys[id] = CryptoKey::new(&self.rand, key, self.nonce_half);
         if use_for_sending {
-            self.current_key = id
+            self.current_key = id;
+            debug!("Current sending key set to slot {}", id);
         }
     }
 

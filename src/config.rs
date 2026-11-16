@@ -44,6 +44,10 @@ pub struct Config {
     pub beacon_password: Option<String>,
     pub mode: Mode,
     pub switch_timeout: Duration,
+    /// Poll wait timeout in milliseconds for the event loop (socket + device)
+    pub poll_timeout_ms: u32,
+    /// Allow SNAT/NAT address change handling (default: true). When false, use new SNAT peer matching logic.
+    pub allow_snat: bool,
     pub claims: Vec<String>,
     pub auto_claim: bool,
     pub port_forwarding: bool,
@@ -84,6 +88,8 @@ impl Default for Config {
             beacon_password: None,
             mode: Mode::Normal,
             switch_timeout: 300,
+            poll_timeout_ms: 50,
+            allow_snat: true,
             claims: vec![],
             auto_claim: true,
             port_forwarding: true,
@@ -282,6 +288,12 @@ impl Config {
         }
         if let Some(val) = args.switch_timeout {
             self.switch_timeout = val;
+        }
+        if let Some(val) = args.poll_timeout_ms {
+            self.poll_timeout_ms = val;
+        }
+        if let Some(false) = args.allow_snat {
+            self.allow_snat = false;
         }
         self.claims.append(&mut args.claims);
         if args.no_auto_claim {
@@ -490,6 +502,14 @@ pub struct Args {
     /// Switch table entry timeout in seconds
     #[structopt(long)]
     pub switch_timeout: Option<Duration>,
+
+    /// Poll wait timeout in milliseconds for the event loop (default: 50)
+    #[structopt(long)]
+    pub poll_timeout_ms: Option<u32>,
+
+    /// Allow SNAT/NAT address change handling (default: true). Use --allow-snat=false to disable.
+    #[structopt(long)]
+    pub allow_snat: Option<bool>,
 
     /// The file path or |command to store the beacon
     #[structopt(long)]
@@ -942,7 +962,9 @@ fn config_merge() {
             hook: None,
             hooks: HashMap::new(),
             ws_proxy: None,
-            insecure: false
+            insecure: false,
+            poll_timeout_ms: 50,
+            allow_snat: true,
         }
     );
 }

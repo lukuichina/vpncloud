@@ -225,3 +225,60 @@ contributions are very welcome:
 
 ### Semantic Versioning
 This project uses [semantic versioning](http://semver.org).
+
+---
+
+## Windows Support (MVP)
+
+VpnCloud now has experimental Windows support via Wintun. The Windows build
+uses a separate device implementation (`WintunDevice`) and a Windows-specific
+poll/wait mechanism (`WindowsWait` based on `WSAEventSelect` + `WFMO`).
+
+### Building on Windows
+
+```sh
+cargo build --release --no-default-features --features nat,websocket
+```
+
+Prerequisites:
+- [Wintun](https://wintun.net/) driver installed
+- Rust toolchain for `x86_64-pc-windows-gnu`
+- `wintun` and `windows-sys` crates (declared under `[target.'cfg(windows)'.dependencies]`)
+
+### Running on Windows
+
+```sh
+vpncloud.exe --ip 10.0.0.1/24 --password mysecret --peer REMOTE_HOST:PORT
+```
+
+Note: `--daemonize`, `--user`, `--group`, and Unix-only privilege dropping are not
+supported on Windows. Use task scheduling or a service wrapper instead.
+
+### Known Limitations
+
+- TUN only (IP layer); TAP (Ethernet) is not supported on Windows
+- Wintun 0.5.1 does not support overlapped I/O, so the device thread still uses
+  event-driven polling (not IOCP)
+- `--ws-proxy` on Windows uses the legacy single-threaded event loop
+---
+
+## `--poll-timeout-ms` (event loop wait timeout)
+
+Controls how long the event loop waits for socket/device activity when idle.
+Lower values reduce latency but increase CPU usage; higher values reduce CPU
+but add latency. Default: `50` ms.
+
+```sh
+$> vpncloud --poll-timeout-ms 5 --ip 10.0.0.1/24 -p mysecret
+```
+
+## `--allow-snat` (SNAT/NAT address change handling)
+
+When enabled (default), vpnCloud tolerates source NAT/NAT address rewriting
+between peers. When set to `false`, vpnCloud uses a stricter peer matching
+algorithm that prefers the peer's claimed listening address over the observed
+transport source address, which is more robust in certain NAT scenarios.
+
+```sh
+$> vpncloud --allow-snat=false --ip 10.0.0.1/24 -p mysecret
+```

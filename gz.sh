@@ -9,7 +9,8 @@ mkdir -p gz
 for dir in build-linux-aarch64-unknown-linux-gnu \
            build-linux-armv7-unknown-linux-gnueabihf \
            build-linux-mipsel-unknown-linux-musl \
-           build-linux-x86_64-unknown-linux-musl; do
+           build-linux-x86_64-unknown-linux-musl \
+           build-windows-x86_64-pc-windows-gnu; do
     bin=$(ls "$dir"/vpncloud-static-* 2>/dev/null | head -1)
     if [ -n "$bin" ]; then
         tar cvfz "gz/${dir}.tar.gz" -C "$dir" "$(basename "$bin")"

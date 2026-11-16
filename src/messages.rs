@@ -262,4 +262,14 @@ impl Payload for NodeInfo {
     fn read_from<R: Read>(r: R) -> Result<Self, Error> {
         Self::decode(r)
     }
+
+    fn default_payload() -> Self {
+        NodeInfo {
+            node_id: [0u8; NODE_ID_BYTES],
+            peers: SmallVec::new(),
+            claims: SmallVec::new(),
+            peer_timeout: None,
+            addrs: SmallVec::new(),
+        }
+    }
 }

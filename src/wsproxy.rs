@@ -2,7 +2,9 @@
 // Copyright (C) 2015-2021  Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
-use super::{
+use crate::{
+    crypto,
+    error::Error,
     net::{get_ip, mapped_addr, parse_listen, Socket},
     poll::{WaitImpl, WaitResult},
     port_forwarding::PortForwarding,
@@ -12,10 +14,14 @@ use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::{
     io::{self, Cursor, Read, Write},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream, UdpSocket},
-    os::unix::io::{AsRawFd, RawFd},
     sync::Arc,
     thread::spawn,
 };
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
 use tungstenite::{protocol::WebSocket, Message, accept, stream::{MaybeTlsStream, NoDelay}, Connector, client_tls_with_config, connect};
 use url::Url;
 use rustls::client::danger::{ServerCertVerifier, ServerCertVerified, HandshakeSignatureValid};
@@ -105,8 +111,16 @@ fn serve_proxy_connection(stream: TcpStream) -> Result<(), io::Error> {
     addr.set_ip(get_ip());
     write_addr(addr, &mut msg)?;
     io_error!(websocket.send(Message::Binary(msg)), "Failed to write to ws connection: {}")?;
-    let websocketfd = websocket.get_ref().as_raw_fd();
-    let poll = WaitImpl::new(websocketfd, udpsocket.as_raw_fd(), 60 * 1000)?;
+    #[cfg(unix)]
+    let poll = {
+        let websocketfd = websocket.get_ref().as_raw_fd();
+        WaitImpl::new(websocketfd, udpsocket.as_raw_fd(), 60 * 1000)?
+    };
+    #[cfg(windows)]
+    let poll = {
+        let websocketfd = websocket.get_ref().as_raw_socket();
+        WaitImpl::new(websocketfd, udpsocket.as_raw_socket(), 60 * 1000)?
+    };
     let mut buffer = [0; 65535];
     for evt in poll {
         match evt {
@@ -225,11 +239,23 @@ impl ProxyConnection {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for ProxyConnection {
     fn as_raw_fd(&self) -> RawFd {
         match self.socket.get_ref() {
             MaybeTlsStream::Plain(stream) => stream.as_raw_fd(),
             MaybeTlsStream::Rustls(stream) => stream.get_ref().as_raw_fd(),
+            _ => panic!("unsupported TLS stream type"),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl AsRawSocket for ProxyConnection {
+    fn as_raw_socket(&self) -> RawSocket {
+        match self.socket.get_ref() {
+            MaybeTlsStream::Plain(stream) => stream.as_raw_socket(),
+            MaybeTlsStream::Rustls(stream) => stream.get_ref().as_raw_socket(),
             _ => panic!("unsupported TLS stream type"),
         }
     }

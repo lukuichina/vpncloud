@@ -6,9 +6,13 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, ErrorKind},
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
-    os::unix::io::{AsRawFd, RawFd},
     sync::atomic::{AtomicBool, Ordering},
 };
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
 
 use super::util::{MockTimeSource, MsgBuffer, Time, TimeSource};
 use crate::{config::DEFAULT_PORT, port_forwarding::PortForwarding};
@@ -56,43 +60,141 @@ pub fn get_ip_v6() -> Option<Ipv6Addr> {
     None
 }
 
+#[cfg(unix)]
 pub trait Socket: AsRawFd + Sized {
     fn listen(addr: &str) -> Result<Self, io::Error>;
     fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error>;
     fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error>;
     fn address(&self) -> Result<SocketAddr, io::Error>;
     fn create_port_forwarding(&self) -> Option<PortForwarding>;
+    /// Returns the number of packets waiting in the receive channel (0 for non-channel sockets).
+    fn pending(&self) -> usize { 0 }
+    /// Channel-mode inbound receiver for low-latency blocking waits in main loop.
+    fn channel_net_rx(&self) -> Option<&crossbeam_channel::Receiver<crate::channel_io::NetPacket>> { None }
+}
+
+#[cfg(windows)]
+pub trait Socket: AsRawSocket + Sized {
+    fn listen(addr: &str) -> Result<Self, io::Error>;
+    fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error>;
+    fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error>;
+    fn address(&self) -> Result<SocketAddr, io::Error>;
+    fn create_port_forwarding(&self) -> Option<PortForwarding>;
+    /// Returns the number of packets waiting in the receive channel (0 for non-channel sockets).
+    fn pending(&self) -> usize { 0 }
+    /// Channel-mode inbound receiver for low-latency blocking waits in main loop.
+    fn channel_net_rx(&self) -> Option<&crossbeam_channel::Receiver<crate::channel_io::NetPacket>> { None }
 }
 
 pub fn parse_listen(addr: &str, default_port: u16) -> SocketAddr {
     if let Some(addr) = addr.strip_prefix("*:") {
         let port = try_fail!(addr.parse::<u16>(), "Invalid port: {}");
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
+        #[cfg(windows)]
+        {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
+        }
+        #[cfg(not(windows))]
+        {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
+        }
     } else if addr.contains(':') {
         try_fail!(addr.parse::<SocketAddr>(), "Invalid address: {}: {}", addr)
     } else if let Ok(port) = addr.parse::<u16>() {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
+        #[cfg(windows)]
+        {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
+        }
+        #[cfg(not(windows))]
+        {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
+        }
     } else {
         let ip = try_fail!(addr.parse::<IpAddr>(), "Invalid addr: {}");
         SocketAddr::new(ip, default_port)
     }
 }
 
+fn socket_bind_addr(addr: SocketAddr) -> SocketAddr {
+    #[cfg(windows)]
+    {
+        match addr {
+            SocketAddr::V6(v6) => {
+                if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                    SocketAddr::new(IpAddr::V4(v4), v6.port())
+                } else {
+                    addr
+                }
+            }
+            _ => addr,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        mapped_addr(addr)
+    }
+}
+
+pub(crate) fn socket_send_addr(addr: SocketAddr) -> SocketAddr {
+    #[cfg(windows)]
+    {
+        match addr {
+            SocketAddr::V6(v6) => {
+                if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                    SocketAddr::new(IpAddr::V4(v4), v6.port())
+                } else {
+                    addr
+                }
+            }
+            _ => addr,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        addr
+    }
+}
+
 impl Socket for UdpSocket {
     fn listen(addr: &str) -> Result<Self, io::Error> {
-        let addr = mapped_addr(parse_listen(addr, DEFAULT_PORT));
-        UdpSocket::bind(addr)
+        let bind_addr = socket_bind_addr(parse_listen(addr, DEFAULT_PORT));
+        info!("Socket::listen: binding UDP socket to {} (from listen={})", bind_addr, addr);
+        let sock = UdpSocket::bind(bind_addr)?;
+        sock.set_nonblocking(true)?;
+        match sock.local_addr() {
+            Ok(local) => info!("Socket::listen: UDP socket bound to local_addr={} nonblocking=true", local),
+            Err(e) => warn!("Socket::listen: bound but failed to get local_addr: {}", e),
+        }
+        Ok(sock)
     }
 
     fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error> {
         buffer.clear();
         let (size, addr) = self.recv_from(buffer.buffer())?;
         buffer.set_length(size);
-        Ok(addr)
+        let mapped = mapped_addr(addr);
+        debug!("Socket.recv_from: {} bytes raw_src={} mapped_src={}", size, addr, mapped);
+        Ok(mapped)
     }
 
     fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error> {
-        self.send_to(data, addr)
+        let dst = socket_send_addr(addr);
+        debug!("Socket.send: {} bytes to dst={} (orig={})", data.len(), dst, addr);
+        let t0 = std::time::Instant::now();
+        match self.send_to(data, dst) {
+            Ok(n) => {
+                let us = t0.elapsed().as_micros();
+                debug!("[UDP_TX] sent {} bytes to {} (orig={}) send_us={}", n, dst, addr, us);
+                if us >= 5_000 {
+                    warn!("[UDP_TX_SLOW] sent {} bytes to {} (orig={}) send_us={}", n, dst, addr, us);
+                }
+                Ok(n)
+            }
+            Err(e) => {
+                let us = t0.elapsed().as_micros();
+                warn!("[UDP_TX] failed to send {} bytes to {} (orig={}): {} send_us={}", data.len(), dst, addr, e, us);
+                Err(e)
+            }
+        }
     }
 
     fn address(&self) -> Result<SocketAddr, io::Error> {
@@ -102,7 +204,17 @@ impl Socket for UdpSocket {
     }
 
     fn create_port_forwarding(&self) -> Option<PortForwarding> {
-        PortForwarding::new(self.address().unwrap().port())
+        let port = match self.address() {
+            Ok(a) => a.port(),
+            Err(e) => {
+                log::warn!("create_port_forwarding: failed to get local address: {}", e);
+                return None;
+            }
+        };
+        log::info!("create_port_forwarding: starting UPnP discovery for port {}", port);
+        let pfw = PortForwarding::new(port);
+        log::info!("create_port_forwarding: finished UPnP discovery for port {} (success={})", port, pfw.is_some());
+        pfw
     }
 }
 
@@ -157,8 +269,16 @@ impl MockSocket {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for MockSocket {
     fn as_raw_fd(&self) -> RawFd {
+        unimplemented!()
+    }
+}
+
+#[cfg(windows)]
+impl AsRawSocket for MockSocket {
+    fn as_raw_socket(&self) -> RawSocket {
         unimplemented!()
     }
 }

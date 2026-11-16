@@ -112,7 +112,11 @@ impl RotationState {
 
     fn send(msg: &RotationMessage, out: &mut MsgBuffer) {
         assert!(out.is_empty());
-        debug!("Rotation sending message with id {}", msg.message_id);
+        debug!(
+            "Rotation sending message: id={}, has_confirm={}",
+            msg.message_id,
+            msg.confirm.is_some()
+        );
         let len;
         {
             let mut cursor = Cursor::new(out.buffer());
@@ -153,9 +157,20 @@ impl RotationState {
 
     pub fn process_message(&mut self, msg: RotationMessage) -> Option<RotatedKey> {
         if msg.message_id <= self.message_id {
+            debug!(
+                "Rotation message id {} ignored (current id {}, has_confirm={})",
+                msg.message_id,
+                self.message_id,
+                msg.confirm.is_some()
+            );
             return None;
         }
-        debug!("Received rotation message with id {}", msg.message_id);
+        debug!(
+            "Received rotation message with id {} (has_confirm={}, current_id={})",
+            msg.message_id,
+            msg.confirm.is_some(),
+            self.message_id
+        );
         self.timeout = false;
         // Create key from proposal and store reply as pending
         let (private_key, public_key) = Self::create_key();
@@ -165,7 +180,10 @@ impl RotationState {
         if let Some(peer_key) = msg.confirm {
             if let Some(private_key) = self.proposed.take() {
                 let key = Self::derive_key(private_key, peer_key);
+                debug!("Rotation derived sending key: id={}", msg.message_id);
                 return Some(RotatedKey { key, id: msg.message_id, use_for_sending: true });
+            } else {
+                debug!("Rotation confirm received but no proposed key pending");
             }
         }
         None
@@ -176,6 +194,7 @@ impl RotationState {
         if let Some(ref private_key) = self.proposed {
             // Still a proposed key that has not been confirmed, proposal must have been lost
             if self.timeout {
+                debug!("Rotation cycle: proposed key pending and timeout, resending");
                 let proposed_key = Self::compute_public_key(private_key);
                 if let Some((ref confirmed_key, message_id)) = self.confirmed {
                     // Reconfirm last confirmed key
@@ -188,6 +207,7 @@ impl RotationState {
                     Self::send(&RotationMessage { confirm: None, propose: proposed_key, message_id: 1 }, out);
                 }
             } else {
+                debug!("Rotation cycle: proposed key pending, waiting for confirmation");
                 self.timeout = true;
             }
         } else {
@@ -200,10 +220,11 @@ impl RotationState {
                 self.proposed = Some(private_key);
                 self.confirmed = Some((confirm_key.clone(), message_id));
                 Self::send(&RotationMessage { confirm: Some(confirm_key), propose: propose_key, message_id }, out);
+                debug!("Rotation cycle: confirmed pending key, emitted receiving key id={}", message_id);
                 return Some(RotatedKey { key, id: message_id, use_for_sending: false });
             } else {
                 // Nothing pending nor proposed, still waiting to receive message 1
-                // Do nothing, peer will retry
+                debug!("Rotation cycle: idle (no pending/proposed), waiting for peer");
             }
         }
         None

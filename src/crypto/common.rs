@@ -39,6 +39,15 @@ const ROTATE_INTERVAL: usize = 120;
 pub trait Payload: Debug + PartialEq + Sized {
     fn write_to(&self, buffer: &mut MsgBuffer);
     fn read_from<R: Read>(r: R) -> Result<Self, Error>;
+    /// Returns a default/empty payload. Used when completing a handshake
+    /// without a crypto core (peer already completed init as initiator).
+    /// Default implementation tries to read from empty data.
+    fn default_payload() -> Self {
+        use std::io::Cursor;
+        Self::read_from(Cursor::new(&[])).unwrap_or_else(|_| {
+            panic!("Payload::default_payload() not implemented for this type")
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -306,15 +315,25 @@ impl<P: Payload> PeerCrypto<P> {
         match result {
             InitResult::Continue => Ok(MessageResult::Reply),
             InitResult::Success { peer_payload, is_initiator } => {
+                let unencrypted_planned = self.get_init()?.selected_algorithm().is_none();
+                debug!(
+                    "Crypto init success: is_initiator={}, unencrypted_planned={}",
+                    is_initiator, unencrypted_planned
+                );
                 self.core = self.get_init()?.take_core();
                 if self.core.is_none() {
                     self.unencrypted = true;
                 }
-                if self.get_init()?.stage() == init::CLOSING {
+                let stage_after = self.get_init()?.stage();
+                if stage_after == init::CLOSING {
+                    debug!("Crypto init: stage CLOSING after success, clearing init state (is_initiator={})", is_initiator);
                     self.init = None
+                } else {
+                    debug!("Crypto init: keeping init state at stage={} (is_initiator={})", stage_after, is_initiator);
                 }
                 if self.core.is_some() {
                     self.rotation = Some(RotationState::new(!is_initiator, buffer));
+                    debug!("Initialized rotation state: is_initiator={}, reply_len={}", is_initiator, buffer.len());
                 }
                 if !is_initiator {
                     if self.unencrypted {
@@ -333,11 +352,15 @@ impl<P: Payload> PeerCrypto<P> {
         if self.unencrypted {
             return Ok(());
         }
+        debug!("Handling rotation payload: {} bytes", data.len());
         if let Some(rot) = self.get_rotation()?.handle_message(data)? {
             let core = self.get_core()?;
             let algo = core.algorithm();
             let key = LessSafeKey::new(UnboundKey::new(algo, &rot.key[..algo.key_len()]).unwrap());
+            debug!("Applying rotated key: id={}, use_for_sending={}", rot.id, rot.use_for_sending);
             core.rotate_key(key, rot.id, rot.use_for_sending);
+        } else {
+            debug!("Rotation payload processed: no key ready/applied");
         }
         Ok(())
     }
@@ -370,12 +393,13 @@ impl<P: Payload> PeerCrypto<P> {
             self.handle_init_message(buffer)
         } else {
             // HOT PATH
-            debug!("Received encrypted message");
+            debug!("Received encrypted message: {} bytes", buffer.len());
             self.decrypt_message(buffer)?;
             let msg_type = buffer.take_prefix();
+            debug!("Decrypted message type={}", msg_type);
             if msg_type == MESSAGE_TYPE_ROTATION {
                 // COLD PATH
-                debug!("Received rotation message");
+                debug!("Received rotation message (decrypted)");
                 self.handle_rotate_message(buffer.buffer())?;
                 buffer.clear();
                 Ok(MessageResult::None)

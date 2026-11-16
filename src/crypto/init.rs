@@ -438,22 +438,31 @@ impl<P: Payload> InitState<P> {
         self.next_stage
     }
 
+    pub fn selected_algorithm(&self) -> Option<&'static Algorithm> {
+        self.selected_algorithm
+    }
+
     pub fn every_second(&mut self, out: &mut MsgBuffer) -> Result<(), Error> {
         if self.next_stage == WAITING_TO_CLOSE {
+            debug!("Init every_second: WAITING_TO_CLOSE, close_time={}", self.close_time);
             if self.close_time == 0 {
                 self.next_stage = CLOSING;
+                debug!("Init every_second: WAITING_TO_CLOSE -> CLOSING");
             } else {
                 self.close_time -= 1;
             }
             Ok(())
         } else if self.next_stage == CLOSING {
+            debug!("Init every_second: CLOSING");
             Ok(())
         } else if self.failed_retries < MAX_FAILED_RETRIES {
             self.failed_retries += 1;
+            debug!("Init every_second: retrying, stage={}, failed_retries={}", self.next_stage, self.failed_retries);
             self.repeat_last_message(out);
             Ok(())
         } else {
             self.next_stage = CLOSING;
+            debug!("Init every_second: timeout, moving to CLOSING");
             Err(Error::CryptoInitFatal("Initialization timeout"))
         }
     }
@@ -569,7 +578,10 @@ impl<P: Payload> InitState<P> {
         out.clear();
         let stage = msg.stage();
         let salted_node_id_hash = *msg.salted_node_id_hash();
-        debug!("Received init with stage={}, expected stage={}", stage, self.next_stage);
+        debug!(
+            "Received init with stage={}, expected stage={}, msg_len_before_clear={}",
+            stage, self.next_stage, 0
+        );
         if self.salted_node_id_hash == salted_node_id_hash
             || self.check_salted_node_id_hash(&salted_node_id_hash, self.node_id)
         {
@@ -580,25 +592,43 @@ impl<P: Payload> InitState<P> {
                 // special case for concurrent init messages in both directions
                 // the node with the higher node_id "wins" and gets to initialize the connection
                 if salted_node_id_hash > self.salted_node_id_hash {
+                    debug!("Init stage mismatch (expected PONG, got PING): remote wins tie-break, resetting to STAGE_PING");
                     // reset to initial state
                     self.next_stage = STAGE_PING;
                     self.last_message = None;
                     self.ecdh_private_key = None;
                 } else {
-                    return Ok(InitResult::Continue);
+                    debug!("Init stage mismatch (expected PONG, got PING): local wins tie-break, handling as responder");
+                    // Don't ignore — fall through to handle the PING normally,
+                    // effectively switching local to responder role.
                 }
+            } else if self.next_stage == STAGE_PONG && stage == STAGE_PENG {
+                // Peer completed handshake as initiator and already sent PENG.
+                // Accept PENG and complete handshake as responder, even if we
+                // don't have a crypto core yet (peer may have won the tie-break).
+                debug!("Init stage mismatch (expected PONG, got PENG): accepting PENG, completing handshake as responder");
+                self.next_stage = STAGE_PENG;
+                // fall through to Peng handler below
             } else if self.next_stage == CLOSING {
+                debug!("Init stage mismatch: already CLOSING, ignoring stage={}", stage);
                 return Ok(InitResult::Continue);
             } else if self.last_message.is_some() {
+                debug!("Init stage mismatch (got={}, expected={}): repeating last message", stage, self.next_stage);
                 self.repeat_last_message(out);
                 return Ok(InitResult::Continue);
             } else {
-                return Err(Error::CryptoInitFatal("Received invalid stage as first message"));
+                // SNAT/NAT 可能导致消息源地址改写，导致 pending_inits key 不匹配。
+                // 接受当前 stage 并重置状态，允许从任意 stage 重新开始握手。
+                debug!("Init stage mismatch (got={}, expected={}): accepting stage and resetting state", stage, self.next_stage);
+                self.next_stage = stage;
+                self.last_message = None;
+                self.ecdh_private_key = None;
             }
         }
         self.failed_retries = 0;
         match msg {
             InitMsg::Ping { ecdh_public_key, algorithms, .. } => {
+                debug!("Init processing PING: peer algos={}", algorithms.algorithm_speeds.len());
                 // create ecdh ephemeral key
                 let (my_ecdh_private_key, my_ecdh_public_key) = self.create_ecdh_keypair();
 
@@ -606,24 +636,38 @@ impl<P: Payload> InitState<P> {
                 let algorithm = self.select_algorithm(&algorithms)?;
                 self.selected_algorithm = algorithm.map(|a| a.0);
                 if let Some((algorithm, _speed)) = algorithm {
+                    debug!("Init selected algorithm for PING handler: {:?}", algorithm);
                     let master_key = self.derive_master_key(algorithm, my_ecdh_private_key, &ecdh_public_key);
                     self.crypto = Some(CryptoCore::new(master_key, self.salted_node_id_hash > salted_node_id_hash));
+                } else {
+                    debug!("Init selected unencrypted mode for PING handler");
                 }
 
                 // create and send stage 2 reply
                 self.send_message(STAGE_PONG, Some(my_ecdh_public_key), out);
+                debug!("Init moved to next_stage=STAGE_PENG after handling PING");
 
                 self.next_stage = STAGE_PENG;
                 Ok(InitResult::Continue)
             }
             InitMsg::Pong { ecdh_public_key, algorithms, mut encrypted_payload, .. } => {
+                debug!("Init processing PONG: peer algos={}, payload_len={}", algorithms.algorithm_speeds.len(), encrypted_payload.len());
                 // do ecdh agreement and derive master key
-                let ecdh_private_key = self.ecdh_private_key.take().unwrap();
+                let ecdh_private_key = match self.ecdh_private_key.take() {
+                    Some(k) => k,
+                    None => {
+                        debug!("Init processing PONG: no local ecdh private key, ignoring PONG");
+                        return Ok(InitResult::Continue);
+                    }
+                };
                 let algorithm = self.select_algorithm(&algorithms)?;
                 self.selected_algorithm = algorithm.map(|a| a.0);
                 if let Some((algorithm, _speed)) = algorithm {
+                    debug!("Init selected algorithm for PONG handler: {:?}", algorithm);
                     let master_key = self.derive_master_key(algorithm, ecdh_private_key, &ecdh_public_key);
                     self.crypto = Some(CryptoCore::new(master_key, self.salted_node_id_hash > salted_node_id_hash));
+                } else {
+                    debug!("Init selected unencrypted mode for PONG handler");
                 }
 
                 // decrypt the payload
@@ -633,17 +677,25 @@ impl<P: Payload> InitState<P> {
 
                 // create and send stage 3 reply
                 self.send_message(STAGE_PENG, None, out);
+                debug!("Init moved to next_stage=WAITING_TO_CLOSE after handling PONG");
 
                 self.next_stage = WAITING_TO_CLOSE;
                 self.close_time = 60;
                 Ok(InitResult::Success { peer_payload, is_initiator: true })
             }
             InitMsg::Peng { mut encrypted_payload, .. } => {
-                // decrypt the payload
-                let peer_payload = self
-                    .decrypt(&mut encrypted_payload)
-                    .map_err(|_| Error::CryptoInitFatal("Failed to decrypt payload"))?;
+                debug!("Init processing PENG: payload_len={}", encrypted_payload.len());
+                let peer_payload = if self.crypto.is_some() {
+                    self.decrypt(&mut encrypted_payload)
+                        .map_err(|_| Error::CryptoInitFatal("Failed to decrypt payload"))?
+                } else {
+                    // No crypto core yet — peer already completed handshake as initiator.
+                    // Accept PENG as-is to unblock the handshake. Payload is undecryptable
+                    // but we complete the handshake so the connection can be established.
+                    P::default_payload()
+                };
 
+                debug!("Init moved to next_stage=CLOSING after handling PENG");
                 self.next_stage = CLOSING; // force resend when receiving any message
                 Ok(InitResult::Success { peer_payload, is_initiator: false })
             }

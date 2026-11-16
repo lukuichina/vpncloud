@@ -16,6 +16,7 @@ pub mod util;
 #[macro_use]
 mod tests;
 pub mod beacon;
+pub mod channel_io;
 pub mod cloud;
 pub mod config;
 pub mod crypto;
@@ -41,15 +42,17 @@ use structopt::StructOpt;
 
 use std::{
     fs::{self, File, Permissions},
-    io::{self, Write},
+    io::{self, Read, Write},
     net::{IpAddr, UdpSocket},
-    os::unix::fs::PermissionsExt,
     path::Path,
     process,
     str::FromStr,
     sync::Mutex,
     thread,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::{
     cloud::GenericCloud,
@@ -170,7 +173,7 @@ fn parse_ip_netmask(addr: &str) -> Result<(std::net::IpAddr, std::net::IpAddr), 
 }
 
 fn setup_device(config: &Config) -> TunTapDevice {
-    let device = try_fail!(
+    let mut device = try_fail!(
         TunTapDevice::new(&config.device_name, config.device_type, config.device_path.as_ref().map(|s| s as &str)),
         "Failed to open virtual {} interface {}: {}",
         config.device_type,
@@ -240,9 +243,17 @@ fn setup_device(config: &Config) -> TunTapDevice {
 }
 
 #[allow(clippy::cognitive_complexity)]
-fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
+fn run<P: Protocol>(config: Config, socket: UdpSocket) {
+    info!("run: setup_device starting");
     let device = setup_device(&config);
+    let device_ifname = device.ifname().to_string();
+    info!("run: setup_device done, ifname={}", device_ifname);
+
     let port_forwarding = if config.port_forwarding { socket.create_port_forwarding() } else { None };
+    if port_forwarding.is_some() {
+        info!("run: port_forwarding enabled (UPnP/NAT-PMP setup attempted)");
+    }
+
     let stats_file = match config.stats_file {
         None => None,
         Some(ref name) => {
@@ -251,6 +262,7 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
                 try_fail!(fs::remove_file(path), "Failed to remove file {}: {}", name);
             }
             let file = try_fail!(File::create(name), "Failed to create stats file: {}");
+            #[cfg(unix)]
             try_fail!(
                 fs::set_permissions(name, Permissions::from_mode(0o644)),
                 "Failed to set permissions on stats file: {}"
@@ -258,13 +270,17 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
             Some(file)
         }
     };
+    info!("run: creating GenericCloud (single-threaded native fast path, direct socket+tun)");
     let mut cloud =
-        GenericCloud::<TunTapDevice, P, S, SystemTimeSource>::new(&config, socket, device, port_forwarding, stats_file);
+        GenericCloud::<TunTapDevice, P, UdpSocket, SystemTimeSource>::new(&config, socket, device, port_forwarding, stats_file);
+    info!("run: GenericCloud created (fast path)");
     for mut addr in config.peers {
+        let orig = addr.clone();
         if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
             // : not present or only in IPv6 address
             addr = format!("{}:{}", addr, DEFAULT_PORT)
         }
+        info!("run: connecting to configured peer orig={} effective={}", orig, addr);
         try_fail!(cloud.connect(&addr as &str), "Failed to send message to {}: {}", &addr);
         cloud.add_reconnect_peer(addr);
     }
@@ -300,13 +316,36 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
     if config.daemonize {
         info!("Daemonize is not supported on this platform");
     }
-    cloud.run();
+    cloud.run_legacy();
     if let Some(script) = config.ifdown {
-        run_script(&script, cloud.ifname());
+        run_script(&script, &device_ifname);
+    }
+}
+
+fn log_binary_md5() {
+    if let Ok(path) = std::env::current_exe() {
+        if let Ok(mut file) = File::open(&path) {
+            use md5::Digest;
+            let mut hasher = md5::Md5::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => hasher.update(&buf[..n]),
+                    Err(_) => return,
+                }
+            }
+            let digest = hasher.finalize();
+            info!("Binary path: {}, MD5: {:x}", path.display(), digest);
+        }
     }
 }
 
 fn main() {
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::Media::timeBeginPeriod(1);
+    }
     let args: Args = Args::from_args();
     if args.version {
         println!("VpnCloud v{}", env!("CARGO_PKG_VERSION"));
@@ -322,6 +361,25 @@ fn main() {
     } else {
         log::LevelFilter::Info
     });
+
+    // Capture panics in logs for easier remote debugging (esp. on Windows background runs).
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        error!("PANIC at {}: {}", loc, payload);
+        eprintln!("PANIC at {}: {}", loc, payload);
+    }));
+
+    log_binary_md5();
     if let Some(cmd) = args.cmd {
         match cmd {
             Command::GenKey { password } => {
@@ -345,6 +403,7 @@ fn main() {
                 );
                 info!("Writing new config back into {}", config_file);
                 let f = try_fail!(File::create(&config_file), "Failed to open config file: {:?}");
+                #[cfg(unix)]
                 try_fail!(
                     fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600)),
                     "Failed to set permissions on file: {:?}"
@@ -417,18 +476,147 @@ fn main() {
     }
     #[cfg(feature = "websocket")]
     if config.listen.starts_with("ws://") || config.listen.starts_with("wss://") {
+        info!("Opening websocket/proxy socket for listen={}", config.listen);
         let socket = if config.insecure {
             try_fail!(ProxyConnection::connect(&config.listen, config.sni.as_deref(), true), "Failed to open socket {}: {}", config.listen)
         } else {
             try_fail!(ProxyConnection::listen(&config.listen), "Failed to open socket {}: {}", config.listen)
         };
+        info!("Socket opened for listen={}, starting cloud", config.listen);
+
+        // Websocket-proxy branch: single-threaded WaitImpl event loop (legacy mode),
+        // because ProxyConnection is not a plain UdpSocket and the dual-thread
+        // channel mode does not apply.
+        info!("run_ws: setup_device starting");
+        let device = setup_device(&config);
+        let device_ifname = device.ifname().to_string();
+        info!("run_ws: setup_device done, ifname={}", device_ifname);
+        info!("run_ws: port_forwarding requested={} (disabled in legacy mode)", config.port_forwarding);
+        let port_forwarding: Option<crate::port_forwarding::PortForwarding> = None;
+        let stats_file = match config.stats_file {
+            None => None,
+            Some(ref name) => {
+                let path = Path::new(name);
+                if path.exists() {
+                    try_fail!(fs::remove_file(path), "Failed to remove file {}: {}", name);
+                }
+                let file = try_fail!(File::create(name), "Failed to create stats file: {}");
+                #[cfg(unix)]
+                try_fail!(
+                    fs::set_permissions(name, Permissions::from_mode(0o644)),
+                    "Failed to set permissions on stats file: {}"
+                );
+                Some(file)
+            }
+        };
+        info!("run_ws: creating GenericCloud");
         match config.device_type {
-            Type::Tap => run::<payload::Frame, _>(config, socket),
-            Type::Tun => run::<payload::Packet, _>(config, socket),
+            Type::Tap => {
+                let mut cloud =
+                    GenericCloud::<TunTapDevice, payload::Frame, ProxyConnection, SystemTimeSource>::new(&config, socket, device, port_forwarding, stats_file);
+                info!("run_ws: GenericCloud created");
+                for mut addr in config.peers {
+                    let orig = addr.clone();
+                    if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
+                        addr = format!("{}:{}", addr, DEFAULT_PORT)
+                    }
+                    info!("run_ws: connecting to configured peer orig={} effective={}", orig, addr);
+                    try_fail!(cloud.connect(&addr as &str), "Failed to send message to {}: {}", &addr);
+                    cloud.add_reconnect_peer(addr);
+                }
+                #[cfg(unix)]
+                if config.daemonize {
+                    info!("Running process as daemon");
+                    let mut daemonize = daemonize::Daemonize::new();
+                    if let Some(user) = config.user {
+                        daemonize = daemonize.user(&user as &str);
+                    }
+                    if let Some(group) = config.group {
+                        daemonize = daemonize.group(&group as &str);
+                    }
+                    if let Some(pid_file) = config.pid_file {
+                        daemonize = daemonize.pid_file(pid_file).chown_pid_file(true);
+                    }
+                    try_fail!(daemonize.start(), "Failed to daemonize: {}");
+                } else {
+                    #[cfg(unix)]
+                    if config.user.is_some() || config.group.is_some() {
+                        info!("Dropping privileges");
+                        let mut pd = privdrop::PrivDrop::default();
+                        if let Some(user) = config.user {
+                            pd = pd.user(user);
+                        }
+                        if let Some(group) = config.group {
+                            pd = pd.group(group);
+                        }
+                        try_fail!(pd.apply(), "Failed to drop privileges: {}");
+                    }
+                }
+                #[cfg(not(unix))]
+                if config.daemonize {
+                    info!("Daemonize is not supported on this platform");
+                }
+                cloud.run_legacy();
+                if let Some(script) = config.ifdown {
+                    run_script(&script, &device_ifname);
+                }
+            }
+            Type::Tun => {
+                let mut cloud =
+                    GenericCloud::<TunTapDevice, payload::Packet, ProxyConnection, SystemTimeSource>::new(&config, socket, device, port_forwarding, stats_file);
+                info!("run_ws: GenericCloud created");
+                for mut addr in config.peers {
+                    let orig = addr.clone();
+                    if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
+                        addr = format!("{}:{}", addr, DEFAULT_PORT)
+                    }
+                    info!("run_ws: connecting to configured peer orig={} effective={}", orig, addr);
+                    try_fail!(cloud.connect(&addr as &str), "Failed to send message to {}: {}", &addr);
+                    cloud.add_reconnect_peer(addr);
+                }
+                #[cfg(unix)]
+                if config.daemonize {
+                    info!("Running process as daemon");
+                    let mut daemonize = daemonize::Daemonize::new();
+                    if let Some(user) = config.user {
+                        daemonize = daemonize.user(&user as &str);
+                    }
+                    if let Some(group) = config.group {
+                        daemonize = daemonize.group(&group as &str);
+                    }
+                    if let Some(pid_file) = config.pid_file {
+                        daemonize = daemonize.pid_file(pid_file).chown_pid_file(true);
+                    }
+                    try_fail!(daemonize.start(), "Failed to daemonize: {}");
+                } else {
+                    #[cfg(unix)]
+                    if config.user.is_some() || config.group.is_some() {
+                        info!("Dropping privileges");
+                        let mut pd = privdrop::PrivDrop::default();
+                        if let Some(user) = config.user {
+                            pd = pd.user(user);
+                        }
+                        if let Some(group) = config.group {
+                            pd = pd.group(group);
+                        }
+                        try_fail!(pd.apply(), "Failed to drop privileges: {}");
+                    }
+                }
+                #[cfg(not(unix))]
+                if config.daemonize {
+                    info!("Daemonize is not supported on this platform");
+                }
+                cloud.run_legacy();
+                if let Some(script) = config.ifdown {
+                    run_script(&script, &device_ifname);
+                }
+            }
         }
         return;
     }
+    info!("Opening UDP socket for listen={}", config.listen);
     let socket = try_fail!(UdpSocket::listen(&config.listen), "Failed to open socket {}: {}", config.listen);
+    info!("UDP socket opened for listen={}", config.listen);
 
     #[cfg(feature = "websocket")]
     if let Some(ref ws_proxy_addr) = config.ws_proxy {
@@ -449,7 +637,7 @@ fn main() {
     }
 
     match config.device_type {
-        Type::Tap => run::<payload::Frame, _>(config, socket),
-        Type::Tun => run::<payload::Packet, _>(config, socket),
+        Type::Tap => run::<payload::Frame>(config, socket),
+        Type::Tun => run::<payload::Packet>(config, socket),
     }
 }

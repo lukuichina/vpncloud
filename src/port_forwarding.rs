@@ -7,7 +7,8 @@ mod internal {
 
     use std::{io, net::SocketAddrV4};
 
-    use igd::{search_gateway, AddAnyPortError, AddPortError, Gateway, PortMappingProtocol, SearchError};
+    use std::time::Duration;
+    use igd::{search_gateway, AddAnyPortError, AddPortError, Gateway, PortMappingProtocol, SearchError, SearchOptions};
 
     use crate::util::{get_internal_ip, SystemTimeSource, Time, TimeSource};
 
@@ -25,7 +26,11 @@ mod internal {
     impl PortForwarding {
         pub fn new(port: u16) -> Option<Self> {
             // Get the gateway
-            let gateway = match search_gateway(Default::default()) {
+            let options = SearchOptions {
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            };
+            let gateway = match search_gateway(options) {
                 Ok(gateway) => gateway,
                 Err(err) => {
                     if let SearchError::IoError(ref err) = err {
