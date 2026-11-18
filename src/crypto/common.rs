@@ -6,11 +6,12 @@ use super::{
 use crate::{
     error::Error,
     types::NodeId,
-    util::{from_base62, to_base62, MsgBuffer},
+    util::{from_base62, to_base62, MsgBuffer, get_machine_id},
 };
 use ring::{
     aead::{self, Algorithm, LessSafeKey, UnboundKey},
     agreement::{EphemeralPrivateKey, UnparsedPublicKey},
+    digest,
     pbkdf2,
     rand::{SecureRandom, SystemRandom},
     signature::{Ed25519KeyPair, KeyPair, ED25519_PUBLIC_KEY_LEN},
@@ -67,7 +68,7 @@ pub struct Config {
 }
 
 pub struct Crypto {
-    node_id: NodeId,
+    pub node_id: NodeId,
     key_pair: Arc<Ed25519KeyPair>,
     trusted_keys: Arc<[Ed25519PublicKey]>,
     algorithms: Algorithms,
@@ -95,7 +96,7 @@ impl Crypto {
         Ok((unencrypted, algos))
     }
 
-    pub fn new(node_id: NodeId, config: &Config) -> Result<Self, Error> {
+    pub fn new(config: &Config) -> Result<Self, Error> {
         let key_pair = if let Some(priv_key) = &config.private_key {
             if let Some(pub_key) = &config.public_key {
                 Self::parse_keypair(priv_key, pub_key)?
@@ -106,6 +107,15 @@ impl Crypto {
             Self::keypair_from_password(password)
         } else {
             return Err(Error::InvalidConfig("Either private_key or password must be set"));
+        };
+        // Derive deterministic node_id:
+        // - If private_key configured: use its public key (user ensures uniqueness)
+        // - If only password: include machine_id to avoid collisions across nodes sharing password
+        let node_id = if config.private_key.is_some() {
+            Self::derive_node_id(key_pair.public_key().as_ref())
+        } else {
+            let machine_id = get_machine_id();
+            Self::derive_node_id_with_salt(key_pair.public_key().as_ref(), Some(&machine_id))
         };
         let mut trusted_keys = vec![];
         for tn in &config.trusted_keys {
@@ -170,6 +180,29 @@ impl Crypto {
         let mut key = [0; 32];
         pbkdf2::derive(pbkdf2::PBKDF2_HMAC_SHA256, NonZeroU32::new(4096).unwrap(), SALT, password.as_bytes(), &mut key);
         Ed25519KeyPair::from_seed_unchecked(&key).unwrap()
+    }
+
+    /// Derive deterministic node_id from Ed25519 public key (SHA256, first 16 bytes)
+    fn derive_node_id(public_key: &[u8]) -> NodeId {
+        assert_eq!(public_key.len(), ED25519_PUBLIC_KEY_LEN);
+        let hash = digest::digest(&digest::SHA256, public_key);
+        let mut node_id = [0u8; 16];
+        node_id.clone_from_slice(&hash.as_ref()[..16]);
+        node_id
+    }
+
+    /// Derive node_id from public key + unique salt (for password-only configs to avoid collisions)
+    fn derive_node_id_with_salt(public_key: &[u8], salt: Option<&str>) -> NodeId {
+        assert_eq!(public_key.len(), ED25519_PUBLIC_KEY_LEN);
+        let mut ctx = digest::Context::new(&digest::SHA256);
+        ctx.update(public_key);
+        if let Some(s) = salt {
+            ctx.update(s.as_bytes());
+        }
+        let hash = ctx.finish();
+        let mut node_id = [0u8; 16];
+        node_id.clone_from_slice(&hash.as_ref()[..16]);
+        node_id
     }
 
     fn parse_keypair(privkey: &str, pubkey: &str) -> Result<Ed25519KeyPair, Error> {
@@ -464,10 +497,7 @@ mod tests {
     use crate::types::NODE_ID_BYTES;
 
     fn create_node(config: &Config) -> PeerCrypto<Vec<u8>> {
-        let rng = SystemRandom::new();
-        let mut node_id = [0; NODE_ID_BYTES];
-        rng.fill(&mut node_id).unwrap();
-        let crypto = Crypto::new(node_id, config).unwrap();
+        let crypto = Crypto::new(config).unwrap();
         crypto.peer_instance(vec![])
     }
 

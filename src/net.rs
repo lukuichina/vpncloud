@@ -12,7 +12,13 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, RawSocket};
+use std::os::windows::io::{AsRawSocket, RawSocket, FromRawSocket};
+
+#[cfg(windows)]
+use socket2::{Domain, Protocol, Socket as Socket2, Type};
+
+#[cfg(windows)]
+use std::os::windows::io::IntoRawSocket;
 
 use super::util::{MockTimeSource, MsgBuffer, Time, TimeSource};
 use crate::{config::DEFAULT_PORT, port_forwarding::PortForwarding};
@@ -71,6 +77,33 @@ pub trait Socket: AsRawFd + Sized {
     fn pending(&self) -> usize { 0 }
     /// Channel-mode inbound receiver for low-latency blocking waits in main loop.
     fn channel_net_rx(&self) -> Option<&crossbeam_channel::Receiver<crate::channel_io::NetPacket>> { None }
+    /// Re-establish the underlying connection after a disconnection.
+    /// Used by WebSocket proxy clients to reconnect without restarting the process.
+    /// Default implementation does nothing (no-op for plain UDP sockets).
+    fn reconnect(&mut self) -> Result<(), io::Error> {
+        Ok(())
+    }
+    /// Flush/drain the receive buffer to discard stale packets after reconnection.
+    /// Default implementation drains kernel socket buffer via FIONREAD + recv_from loop.
+    fn flush_receive_buffer(&mut self) -> Result<(), io::Error> {
+        use std::os::unix::io::AsRawFd;
+        let fd = self.as_raw_fd();
+        // Drain kernel receive buffer
+        let mut bytes: libc::c_int = 0;
+        let ret = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut bytes) };
+        if ret == 0 && bytes > 0 {
+            let mut buf = vec![0u8; bytes as usize];
+            let mut drained = 0;
+            while drained < bytes {
+                match self.receive(&mut MsgBuffer::new(0)) {
+                    Ok(_) => drained += 1,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -84,30 +117,56 @@ pub trait Socket: AsRawSocket + Sized {
     fn pending(&self) -> usize { 0 }
     /// Channel-mode inbound receiver for low-latency blocking waits in main loop.
     fn channel_net_rx(&self) -> Option<&crossbeam_channel::Receiver<crate::channel_io::NetPacket>> { None }
+    /// Re-establish the underlying connection after a disconnection.
+    /// Used by WebSocket proxy clients to reconnect without restarting the process.
+    /// Default implementation does nothing (no-op for plain UDP sockets).
+    fn reconnect(&mut self) -> Result<(), io::Error> {
+        Ok(())
+    }
+    /// Flush/drain the receive buffer to discard stale packets after reconnection.
+    /// Default implementation drains kernel socket buffer via WSAIoctl + recv_from loop.
+    fn flush_receive_buffer(&mut self) -> Result<(), io::Error> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{WSAIoctl, FIONREAD, SOCKET_ERROR, SOCKET};
+        let socket = self.as_raw_socket() as SOCKET;
+        let mut bytes: u32 = 0;
+        let mut bytes_returned: u32 = 0;
+        let ret = unsafe {
+            WSAIoctl(
+                socket,
+                FIONREAD as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes as *mut _ as *mut _,
+                std::mem::size_of::<u32>() as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if ret != SOCKET_ERROR && bytes > 0 {
+            let mut drained = 0;
+            while drained < bytes {
+                match self.receive(&mut MsgBuffer::new(0)) {
+                    Ok(_) => drained += 1,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn parse_listen(addr: &str, default_port: u16) -> SocketAddr {
     if let Some(addr) = addr.strip_prefix("*:") {
         let port = try_fail!(addr.parse::<u16>(), "Invalid port: {}");
-        #[cfg(windows)]
-        {
-            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
-        }
-        #[cfg(not(windows))]
-        {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
-        }
+        // Prefer dual-stack-capable wildcard on all platforms; bind logic handles fallback.
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
     } else if addr.contains(':') {
         try_fail!(addr.parse::<SocketAddr>(), "Invalid address: {}: {}", addr)
     } else if let Ok(port) = addr.parse::<u16>() {
-        #[cfg(windows)]
-        {
-            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
-        }
-        #[cfg(not(windows))]
-        {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
-        }
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
     } else {
         let ip = try_fail!(addr.parse::<IpAddr>(), "Invalid addr: {}");
         SocketAddr::new(ip, default_port)
@@ -115,50 +174,73 @@ pub fn parse_listen(addr: &str, default_port: u16) -> SocketAddr {
 }
 
 fn socket_bind_addr(addr: SocketAddr) -> SocketAddr {
-    #[cfg(windows)]
-    {
-        match addr {
-            SocketAddr::V6(v6) => {
-                if let Some(v4) = v6.ip().to_ipv4_mapped() {
-                    SocketAddr::new(IpAddr::V4(v4), v6.port())
-                } else {
-                    addr
-                }
-            }
-            _ => addr,
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        mapped_addr(addr)
-    }
+    // Keep v4-mapped handling for explicit mapped addresses, but do not force
+    // wildcard IPv6 down to IPv4 here; dual-stack/IPv6 support needs [::] binds.
+    addr
 }
 
 pub(crate) fn socket_send_addr(addr: SocketAddr) -> SocketAddr {
-    #[cfg(windows)]
-    {
-        match addr {
-            SocketAddr::V6(v6) => {
-                if let Some(v4) = v6.ip().to_ipv4_mapped() {
-                    SocketAddr::new(IpAddr::V4(v4), v6.port())
-                } else {
-                    addr
-                }
-            }
-            _ => addr,
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        addr
-    }
+    // Address-family normalization is handled in UdpSocket::send based on the
+    // actual bound socket family (important for Windows dual-stack sockets).
+    addr
 }
 
 impl Socket for UdpSocket {
     fn listen(addr: &str) -> Result<Self, io::Error> {
-        let bind_addr = socket_bind_addr(parse_listen(addr, DEFAULT_PORT));
+        let parsed = parse_listen(addr, DEFAULT_PORT);
+        let bind_addr = socket_bind_addr(parsed);
         info!("Socket::listen: binding UDP socket to {} (from listen={})", bind_addr, addr);
-        let sock = UdpSocket::bind(bind_addr)?;
+
+        #[cfg(windows)]
+        {
+            // On Windows, use socket2 to create a dual-stack socket with IPV6_V6ONLY=0
+            // so that a single [::] socket can handle both IPv6 and IPv4 (via v4-mapped).
+            if let SocketAddr::V6(v6) = bind_addr {
+                if v6.ip().is_unspecified() && v6.port() > 0 {
+                    let port = v6.port();
+                    match Socket2::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+                        Ok(sock2) => {
+                            // Disable IPV6_V6ONLY to enable dual-stack (IPv4 via v4-mapped)
+                            let _ = sock2.set_only_v6(false);
+                            // Set non-blocking
+                            let _ = sock2.set_nonblocking(true);
+                            // Bind to [::]:port
+                            let sockaddr = socket2::SockAddr::from(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port));
+                            if sock2.bind(&sockaddr).is_ok() {
+                                let raw = sock2.into_raw_socket();
+                                // Convert to std::net::UdpSocket
+                                let sock = unsafe { UdpSocket::from_raw_socket(raw) };
+                                info!("Socket::listen: UDP socket bound to local_addr=[::]:{} nonblocking=true (dual-stack)", port);
+                                return Ok(sock);
+                            }
+                            // If bind fails, fall through to fallback
+                        }
+                        Err(e) => {
+                            warn!("Socket::listen: socket2 creation failed ({}), falling back to std bind", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Standard bind (Unix, or Windows fallback / non-wildcard addresses)
+        let sock = match UdpSocket::bind(bind_addr) {
+            Ok(s) => s,
+            Err(e) => {
+                // Fallback for platforms/configs where [::] dual-stack bind is unavailable.
+                if let SocketAddr::V6(v6) = bind_addr {
+                    if v6.ip().is_unspecified() {
+                        let v4 = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), v6.port());
+                        warn!("Socket::listen: failed to bind {} ({}), falling back to {}", bind_addr, e, v4);
+                        UdpSocket::bind(v4)?
+                    } else {
+                        return Err(e);
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         sock.set_nonblocking(true)?;
         match sock.local_addr() {
             Ok(local) => info!("Socket::listen: UDP socket bound to local_addr={} nonblocking=true", local),
@@ -177,24 +259,65 @@ impl Socket for UdpSocket {
     }
 
     fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error> {
-        let dst = socket_send_addr(addr);
-        debug!("Socket.send: {} bytes to dst={} (orig={})", data.len(), dst, addr);
-        let t0 = std::time::Instant::now();
-        match self.send_to(data, dst) {
-            Ok(n) => {
-                let us = t0.elapsed().as_micros();
-                debug!("[UDP_TX] sent {} bytes to {} (orig={}) send_us={}", n, dst, addr, us);
-                if us >= 5_000 {
-                    warn!("[UDP_TX_SLOW] sent {} bytes to {} (orig={}) send_us={}", n, dst, addr, us);
-                }
-                Ok(n)
+        // Select sockaddr family compatible with the bound local socket.
+        // - IPv6 socket ([::] / dual-stack): IPv4 peers must be sent as v4-mapped IPv6.
+        // - IPv4 socket (fallback): v4-mapped IPv6 peers must be sent as IPv4.
+        // Some Windows environments return WSAEFAULT(10014)/WSAEADDRNOTAVAIL(10049) on mismatch.
+        let local_is_v6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(addr.is_ipv6());
+        let mut candidates: Vec<SocketAddr> = Vec::with_capacity(2);
+        match (local_is_v6, addr) {
+            (true, SocketAddr::V4(v4)) => {
+                candidates.push(SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()));
+                candidates.push(addr);
             }
-            Err(e) => {
-                let us = t0.elapsed().as_micros();
-                warn!("[UDP_TX] failed to send {} bytes to {} (orig={}): {} send_us={}", data.len(), dst, addr, e, us);
-                Err(e)
+            (true, SocketAddr::V6(v6)) => {
+                candidates.push(addr);
+                if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                    candidates.push(SocketAddr::new(IpAddr::V4(v4), v6.port()));
+                }
+            }
+            (false, SocketAddr::V6(v6)) => {
+                if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                    candidates.push(SocketAddr::new(IpAddr::V4(v4), v6.port()));
+                }
+                candidates.push(addr);
+            }
+            (false, SocketAddr::V4(_)) => {
+                candidates.push(addr);
             }
         }
+
+        let t0 = std::time::Instant::now();
+        let mut last_err: Option<io::Error> = None;
+        for (i, dst) in candidates.iter().copied().enumerate() {
+            debug!(
+                "Socket.send: {} bytes to dst={} (orig={}) local_v6={} attempt={}/{}",
+                data.len(), dst, addr, local_is_v6, i + 1, candidates.len()
+            );
+            match self.send_to(data, dst) {
+                Ok(n) => {
+                    let us = t0.elapsed().as_micros();
+                    debug!("[UDP_TX] sent {} bytes to {} (orig={}) send_us={}", n, dst, addr, us);
+                    if us >= 5_000 {
+                        warn!("[UDP_TX_SLOW] sent {} bytes to {} (orig={}) send_us={}", n, dst, addr, us);
+                    }
+                    return Ok(n);
+                }
+                Err(e) => {
+                    let us = t0.elapsed().as_micros();
+                    let retryable = matches!(e.raw_os_error(), Some(10014) | Some(10049) | Some(97) | Some(22));
+                    warn!(
+                        "[UDP_TX] failed to send {} bytes to {} (orig={}): {} send_us={} retryable={}",
+                        data.len(), dst, addr, e, us, retryable
+                    );
+                    last_err = Some(e);
+                    if !retryable || i + 1 == candidates.len() {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "UDP send failed")))
     }
 
     fn address(&self) -> Result<SocketAddr, io::Error> {
@@ -215,6 +338,47 @@ impl Socket for UdpSocket {
         let pfw = PortForwarding::new(port);
         log::info!("create_port_forwarding: finished UPnP discovery for port {} (success={})", port, pfw.is_some());
         pfw
+    }
+
+    fn pending(&self) -> usize {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.as_raw_fd();
+            let mut bytes: libc::c_int = 0;
+            // Use FIONREAD to get number of bytes pending in kernel receive buffer
+            let ret = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut bytes) };
+            if ret == 0 && bytes > 0 {
+                // Estimate packets: assume average packet size ~500 bytes
+                return (bytes as usize).div_ceil(500).min(256);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{WSAIoctl, FIONREAD, SOCKET_ERROR, SOCKET};
+            let socket = self.as_raw_socket() as SOCKET;
+            let mut bytes: u32 = 0;
+            let mut bytes_returned: u32 = 0;
+            // Use WSAIoctl with FIONREAD to get bytes pending
+            let ret = unsafe {
+                WSAIoctl(
+                    socket,
+                    FIONREAD as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut bytes as *mut _ as *mut _,
+                    std::mem::size_of::<u32>() as u32,
+                    &mut bytes_returned,
+                    std::ptr::null_mut(),
+                    None,
+                )
+            };
+            if ret != SOCKET_ERROR && bytes > 0 {
+                return (bytes as usize).div_ceil(500).min(256);
+            }
+        }
+        0
     }
 }
 
@@ -313,6 +477,10 @@ impl Socket for MockSocket {
 
     fn create_port_forwarding(&self) -> Option<PortForwarding> {
         None
+    }
+
+    fn reconnect(&mut self) -> Result<(), io::Error> {
+        Ok(())
     }
 }
 

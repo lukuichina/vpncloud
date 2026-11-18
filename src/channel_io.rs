@@ -282,6 +282,14 @@ impl Socket for ChannelSocket {
     }
 
     fn channel_net_rx(&self) -> Option<&crossbeam_channel::Receiver<NetPacket>> { Some(&self.net_rx) }
+
+    fn flush_receive_buffer(&mut self) -> Result<(), io::Error> {
+        // Drain the inbound channel queue to discard stale packets after reconnection
+        while self.net_rx.try_recv().is_ok() {
+            // Discard packet
+        }
+        Ok(())
+    }
 }
 
 /// ---------------- Channel-backed Device ------------------

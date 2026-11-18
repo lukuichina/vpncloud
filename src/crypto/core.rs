@@ -194,7 +194,9 @@ impl CryptoCore {
     }
 
     pub fn decrypt(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
-        assert!(buffer.len() >= EXTRA_LEN + TAG_LEN);
+        if buffer.len() < EXTRA_LEN + TAG_LEN {
+            return Err(Error::Crypto("Packet too short for decryption"));
+        }
         let orig_len = buffer.len();
         let (extra, data_and_tag) = buffer.message_mut().split_at_mut(EXTRA_LEN);
         let key_id;

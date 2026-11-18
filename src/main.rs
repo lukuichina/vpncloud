@@ -43,12 +43,13 @@ use structopt::StructOpt;
 use std::{
     fs::{self, File, Permissions},
     io::{self, Read, Write},
-    net::{IpAddr, UdpSocket},
+    net::{IpAddr, SocketAddr, UdpSocket},
     path::Path,
     process,
     str::FromStr,
     sync::Mutex,
     thread,
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -184,48 +185,109 @@ fn setup_device(config: &Config) -> TunTapDevice {
     if let Err(err) = device.set_mtu(None) {
         error!("Error setting optimal MTU on {}: {}", device.ifname(), err);
     }
-    if let Some(ip) = &config.ip {
-        let (ip, netmask) = try_fail!(parse_ip_netmask(ip), "Invalid ip address given: {}");
-        info!("Configuring device with ip {}, netmask {}", ip, netmask);
+    // Configure interface addresses. Support dual-stack by applying --ip and, when
+    // different, --ipv6 as an additional address on the same device.
+    let mut configured_addrs: Vec<std::net::IpAddr> = Vec::new();
+    let mut primary_addr: Option<String> = config.ip.clone();
+    if primary_addr.is_none() {
+        primary_addr = config.ipv6.clone();
+    }
+    if let Some(ref ip_str) = primary_addr {
+        let (ip, netmask) = try_fail!(parse_ip_netmask(ip_str), "Invalid ip address given: {}");
+        info!("Configuring device with primary ip {}, netmask {}", ip, netmask);
         if let Err(e) = device.configure(ip, netmask) {
             fail!("Failed to configure device: {}: {}", ip, e);
         }
+        configured_addrs.push(ip);
 
-// Automatic underlay routing: add routes for claimed subnets via the TUN device
+        // Add IPv6 route for primary IPv6 claims (legacy behavior).
         if let IpAddr::V6(_) = ip {
             for claim_str in &config.claims {
                 if let Ok(claim) = crate::types::Range::from_str(claim_str) {
-                    match claim.base {
-                        Address { data, len: 16 } => {
-                            // IPv6 claim: convert 16-byte address back to Ipv6Addr
-                            let ip6 = std::net::Ipv6Addr::from(data);
-                            let prefix = claim.prefix_len;
-                            if prefix > 0 && prefix <= 128 {
-                                let ifname = device.ifname();
-                                let status = std::process::Command::new("ip")
-                                    .args(["route", "add", &format!("{}/{}", ip6, prefix), "dev", ifname])
-                                    .status();
-                                match status {
-                                    Ok(s) if s.success() => {
-                                        info!("Added IPv6 route {}/{} via dev {}", ip6, prefix, ifname);
-                                    }
-                                    Ok(s) => {
-                                        warn!("Failed to add IPv6 route {}/{} via dev {}: status {:?}", ip6, prefix, ifname, s);
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to add IPv6 route {}/{} via dev {}: {}", ip6, prefix, ifname, e);
-                                    }
+                    if let Address { data, len: 16 } = claim.base {
+                        let ip6 = std::net::Ipv6Addr::from(data);
+                        let prefix = claim.prefix_len;
+                        if prefix > 0 && prefix <= 128 {
+                            let ifname = device.ifname();
+                            let status = std::process::Command::new("ip")
+                                .args(["route", "add", &format!("{}/{}", ip6, prefix), "dev", ifname])
+                                .status();
+                            match status {
+                                Ok(s) if s.success() => {
+                                    info!("Added IPv6 route {}/{} via dev {}", ip6, prefix, ifname);
+                                }
+                                Ok(s) => {
+                                    warn!("Failed to add IPv6 route {}/{} via dev {}: status {:?}", ip6, prefix, ifname, s);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to add IPv6 route {}/{} via dev {}: {}", ip6, prefix, ifname, e);
                                 }
                             }
-                        }
-                        _ => {
-                            // IPv4 claims are handled by the kernel's existing routing or ifup script
                         }
                     }
                 }
             }
         }
-
+    }
+    if let Some(ref ipv6_addr) = config.ipv6 {
+        let already = config.ip.as_ref().map(|s| s == ipv6_addr).unwrap_or(false);
+        if !already {
+            let (ip, netmask) = try_fail!(parse_ip_netmask(ipv6_addr), "Invalid ipv6 address given: {}");
+            if !configured_addrs.iter().any(|a| *a == ip) {
+                info!("Configuring device with additional IPv6 address {}, netmask {}", ip, netmask);
+                #[cfg(unix)]
+                {
+                    // Best-effort add secondary IPv6 on Unix/Linux TUN.
+                    let prefix = match netmask {
+                        IpAddr::V6(mask) => mask.octets().iter().map(|b| b.count_ones() as u32).sum::<u32>(),
+                        _ => 64,
+                    };
+                    let ifname = device.ifname();
+                    let status = std::process::Command::new("ip")
+                        .args(["addr", "add", &format!("{}/{}", match ip { IpAddr::V6(v)=>v, _=>unreachable!() }, prefix), "dev", ifname])
+                        .status();
+                    match status {
+                        Ok(s) if s.success() => info!("Added IPv6 address {}/{} to dev {}", match ip { IpAddr::V6(v)=>v.to_string(), _=>ip.to_string() }, prefix, ifname),
+                        Ok(s) => warn!("Failed to add IPv6 address to dev {} via ip addr add: status {:?}", ifname, s),
+                        Err(e) => warn!("Failed to add IPv6 address to dev {}: {}", ifname, e),
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    // Best-effort add secondary IPv6 on Windows Wintun adapter.
+                    let prefix = match netmask {
+                        IpAddr::V6(mask) => mask.octets().iter().map(|b| b.count_ones() as u32).sum::<u32>(),
+                        _ => 64,
+                    };
+                    let ifname = device.ifname();
+                    let ip_str = match ip { IpAddr::V6(v)=>v.to_string(), _=>ip.to_string() };
+                    let output = std::process::Command::new("netsh")
+                        .args([
+                            "interface", "ipv6", "add", "address",
+                            &format!("interface={}", ifname),
+                            &format!("address={}", ip_str),
+                            "type=unicast",
+                            &format!("store=active"),
+                        ])
+                        .output();
+                    match output {
+                        Ok(o) if o.status.success() => {
+                            info!("Added IPv6 address {}/{} to Windows interface {}", ip_str, prefix, ifname);
+                        }
+                        Ok(o) => {
+                            warn!(
+                                "Failed to add IPv6 address {} to Windows interface {}: status={:?} stdout='{}' stderr='{}'",
+                                ip_str, ifname, o.status,
+                                String::from_utf8_lossy(&o.stdout).trim(),
+                                String::from_utf8_lossy(&o.stderr).trim()
+                            );
+                        }
+                        Err(e) => warn!("Failed to add IPv6 address {} to Windows interface {}: {}", ip_str, ifname, e),
+                    }
+                }
+                configured_addrs.push(ip);
+            }
+        }
     }
     if let Some(script) = &config.ifup {
         run_script(script, device.ifname());
@@ -274,7 +336,7 @@ fn run<P: Protocol>(config: Config, socket: UdpSocket) {
     let mut cloud =
         GenericCloud::<TunTapDevice, P, UdpSocket, SystemTimeSource>::new(&config, socket, device, port_forwarding, stats_file);
     info!("run: GenericCloud created (fast path)");
-    for mut addr in config.peers {
+    for mut addr in config.peers.iter().cloned() {
         let orig = addr.clone();
         if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
             // : not present or only in IPv6 address
@@ -316,7 +378,34 @@ fn run<P: Protocol>(config: Config, socket: UdpSocket) {
     if config.daemonize {
         info!("Daemonize is not supported on this platform");
     }
-    cloud.run_legacy();
+    // Native fast path: run_legacy() returns false when the underlying
+    // socket dies (disconnection). Reconnect the socket and re-establish the
+    // peer connections instead of exiting the process.
+    loop {
+        let ok = cloud.run_legacy();
+        if ok {
+            break;
+        }
+        info!("run: socket connection lost, attempting reconnect...");
+        if let Err(e) = cloud.socket_reconnect() {
+            error!("run: socket reconnect failed: {}, exiting", e);
+            break;
+        }
+        // Re-establish peer connections.
+        for mut addr in config.peers.iter().cloned() {
+            let orig = addr.clone();
+            if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
+                addr = format!("{}:{}", addr, DEFAULT_PORT)
+            }
+            info!("run: reconnecting to configured peer orig={} effective={}", orig, addr);
+            if let Err(e) = cloud.connect(&addr as &str) {
+                error!("run: failed to reconnect to {}: {}, exiting", addr, e);
+                break;
+            }
+            cloud.add_reconnect_peer(addr);
+        }
+        info!("run: socket reconnected, resuming event loop");
+    }
     if let Some(script) = config.ifdown {
         run_script(&script, &device_ifname);
     }
@@ -454,10 +543,11 @@ fn main() {
     let listen_was_explicit = args.listen.is_some();
     config.merge_args(args);
 
-    // --ipv6 <addr>: use specified IPv6 address when --ip is not given
-    if let Some(ref ipv6_addr) = config.ipv6 {
-        if config.ip.is_none() {
-            info!("Using IPv6 address {} due to --ipv6", ipv6_addr);
+    // --ip and --ipv6 can be specified together for dual-stack (IPv4+IPv6).
+    // If only --ipv6 is provided, keep legacy behavior: treat it as the primary interface address.
+    if config.ip.is_none() {
+        if let Some(ref ipv6_addr) = config.ipv6 {
+            info!("Using IPv6 address {} due to --ipv6 (no --ip provided)", ipv6_addr);
             config.ip = Some(ipv6_addr.clone());
         }
     }
@@ -475,14 +565,26 @@ fn main() {
         return;
     }
     #[cfg(feature = "websocket")]
+    {
+        info!("=== WEBSOCKET FEATURE IS ENABLED AT COMPILE TIME ===");
+    }
+    #[cfg(not(feature = "websocket"))]
+    {
+        info!("=== WEBSOCKET FEATURE IS DISABLED AT COMPILE TIME ===");
+    }
+    #[cfg(feature = "websocket")]
     if config.listen.starts_with("ws://") || config.listen.starts_with("wss://") {
+        info!("=== ENTERING RUN_WS PATH (websocket feature enabled) ===");
         info!("Opening websocket/proxy socket for listen={}", config.listen);
         let socket = if config.insecure {
             try_fail!(ProxyConnection::connect(&config.listen, config.sni.as_deref(), true), "Failed to open socket {}: {}", config.listen)
         } else {
             try_fail!(ProxyConnection::listen(&config.listen), "Failed to open socket {}: {}", config.listen)
         };
-        info!("Socket opened for listen={}, starting cloud", config.listen);
+        // In WebSocket mode, the proxy assigns a UDP address to this client.
+        // Use that assigned address as the local address (for routing).
+        let mut ws_proxy_peer = socket.address().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        info!("Socket opened for listen={}, WebSocket proxy assigned peer={}, starting cloud", config.listen, ws_proxy_peer);
 
         // Websocket-proxy branch: single-threaded WaitImpl event loop (legacy mode),
         // because ProxyConnection is not a plain UdpSocket and the dual-thread
@@ -515,13 +617,47 @@ fn main() {
                 let mut cloud =
                     GenericCloud::<TunTapDevice, payload::Frame, ProxyConnection, SystemTimeSource>::new(&config, socket, device, port_forwarding, stats_file);
                 info!("run_ws: GenericCloud created");
-                for mut addr in config.peers {
+                // In WebSocket mode, the proxy's assigned UDP address is our local transport address.
+                // The -c/peer address is used for INIT and as the destination for send().
+                // Cloud's initialize() already adds socket address to own_addresses.
+                // Add virtual IPs with the WebSocket proxy's UDP port for routing.
+                let proxy_port = ws_proxy_peer.port();
+                let mut own_addrs = Vec::new();
+                if let Some(ip_str) = &config.ip {
+                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                        own_addrs.push(SocketAddr::new(ip, proxy_port));
+                    }
+                }
+                if let Some(ipv6_str) = &config.ipv6 {
+                    if let Ok(ipv6) = ipv6_str.parse::<IpAddr>() {
+                        own_addrs.push(SocketAddr::new(ipv6, proxy_port));
+                    }
+                }
+                for addr in &config.advertise_addresses {
+                    own_addrs.push(addr.parse().unwrap());
+                }
+                cloud.set_own_addresses(own_addrs);
+                // Use configured peer (-c) as gateway for INIT (original vpncloud design).
+                // The proxy will forward to the destination specified in each packet.
+                let gateway_peer = if !config.peers.is_empty() {
+                    let mut peer = config.peers[0].clone();
+                    if peer.find(':').unwrap_or(0) <= peer.find(']').unwrap_or(0) {
+                        peer = format!("{}:{}", peer, DEFAULT_PORT);
+                    }
+                    peer
+                } else {
+                    ws_proxy_peer.to_string()
+                };
+                info!("run_ws: using configured peer as gateway: {}", gateway_peer);
+                try_fail!(cloud.connect(&gateway_peer), "Failed to send message to {}: {}", &gateway_peer);
+                cloud.add_reconnect_peer(gateway_peer.clone());
+                // Add configured peers for mesh discovery through the proxy
+                for mut addr in config.peers.iter().cloned() {
                     let orig = addr.clone();
                     if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
-                        addr = format!("{}:{}", addr, DEFAULT_PORT)
+                        addr = format!("{}:{}", addr, DEFAULT_PORT);
                     }
-                    info!("run_ws: connecting to configured peer orig={} effective={}", orig, addr);
-                    try_fail!(cloud.connect(&addr as &str), "Failed to send message to {}: {}", &addr);
+                    info!("run_ws: adding configured peer for mesh discovery orig={} effective={}", orig, addr);
                     cloud.add_reconnect_peer(addr);
                 }
                 #[cfg(unix)]
@@ -556,7 +692,74 @@ fn main() {
                 if config.daemonize {
                     info!("Daemonize is not supported on this platform");
                 }
-                cloud.run_legacy();
+                // WebSocket proxy mode: run_legacy() returns false when the underlying
+                // socket dies (disconnection). Reconnect the socket and re-establish the
+                // peer connection instead of exiting the process.
+                // Similar to v0.0.5's housekeep(): periodic retry loop instead of one-shot.
+                loop {
+                    let ok = cloud.run_legacy();
+                    if ok {
+                        break;
+                    }
+                    info!("run_ws: WebSocket connection lost, entering reconnect loop...");
+                    
+                    // Retry loop: keep trying every 5 seconds until reconnect succeeds
+                    loop {
+                        info!("run_ws: attempting WebSocket reconnect...");
+                        match cloud.socket_reconnect() {
+                            Ok(_) => {
+                                info!("run_ws: socket reconnected, re-establishing gateway...");
+                                // Update ws_proxy_peer with new address from reconnected socket
+                                if let Ok(new_addr) = cloud.socket_address() {
+                                    ws_proxy_peer = new_addr;
+                                    // Update own_addresses with new proxy port
+                                    let proxy_port = ws_proxy_peer.port();
+                                    let mut own_addrs = Vec::new();
+                                    if let Some(ip_str) = &config.ip {
+                                        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                                            own_addrs.push(SocketAddr::new(ip, proxy_port));
+                                        }
+                                    }
+                                    if let Some(ipv6_str) = &config.ipv6 {
+                                        if let Ok(ipv6) = ipv6_str.parse::<IpAddr>() {
+                                            own_addrs.push(SocketAddr::new(ipv6, proxy_port));
+                                        }
+                                    }
+                                    for addr in &config.advertise_addresses {
+                                        own_addrs.push(addr.parse().unwrap());
+                                    }
+                                    cloud.set_own_addresses(own_addrs);
+                                    info!("run_ws: updated own_addresses with new proxy port {}", proxy_port);
+                                }
+                                let gateway_peer = if !config.peers.is_empty() {
+                                    let mut peer = config.peers[0].clone();
+                                    if peer.find(':').unwrap_or(0) <= peer.find(']').unwrap_or(0) {
+                                        peer = format!("{}:{}", peer, DEFAULT_PORT);
+                                    }
+                                    peer
+                                } else {
+                                    ws_proxy_peer.to_string()
+                                };
+                                match cloud.connect(&gateway_peer) {
+                                    Ok(_) => {
+                                        info!("run_ws: gateway reconnected, resuming event loop");
+                                        break; // Reconnect successful, resume run_legacy loop
+                                    }
+                                    Err(e) => {
+                                        error!("run_ws: failed to reconnect to gateway {}: {}", gateway_peer, e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("run_ws: socket reconnect failed: {}", e);
+                            }
+                        }
+                        // Wait 5 seconds before next retry
+                        info!("run_ws: reconnect failed, retrying in 5 seconds...");
+                        thread::sleep(Duration::from_secs(5));
+                    }
+                    info!("run_ws: reconnect successful, resuming event loop");
+                }
                 if let Some(script) = config.ifdown {
                     run_script(&script, &device_ifname);
                 }
@@ -565,13 +768,47 @@ fn main() {
                 let mut cloud =
                     GenericCloud::<TunTapDevice, payload::Packet, ProxyConnection, SystemTimeSource>::new(&config, socket, device, port_forwarding, stats_file);
                 info!("run_ws: GenericCloud created");
-                for mut addr in config.peers {
+                // In WebSocket mode, ALL traffic goes to the WebSocket proxy's assigned UDP address.
+                // The -c/peer address is only used to establish the WebSocket connection.
+                // Cloud's initialize() already adds socket address to own_addresses.
+                // Add virtual IPs with the WebSocket proxy's UDP port for routing.
+                let proxy_port = ws_proxy_peer.port();
+                let mut own_addrs = Vec::new();
+                if let Some(ip_str) = &config.ip {
+                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                        own_addrs.push(SocketAddr::new(ip, proxy_port));
+                    }
+                }
+                if let Some(ipv6_str) = &config.ipv6 {
+                    if let Ok(ipv6) = ipv6_str.parse::<IpAddr>() {
+                        own_addrs.push(SocketAddr::new(ipv6, proxy_port));
+                    }
+                }
+                for addr in &config.advertise_addresses {
+                    own_addrs.push(addr.parse().unwrap());
+                }
+                cloud.set_own_addresses(own_addrs);
+                // Use configured peer (-c) as gateway for INIT (original vpncloud design).
+                // The proxy will forward to the destination specified in each packet.
+                let gateway_peer = if !config.peers.is_empty() {
+                    let mut peer = config.peers[0].clone();
+                    if peer.find(':').unwrap_or(0) <= peer.find(']').unwrap_or(0) {
+                        peer = format!("{}:{}", peer, DEFAULT_PORT);
+                    }
+                    peer
+                } else {
+                    ws_proxy_peer.to_string()
+                };
+                info!("run_ws: using configured peer as gateway: {}", gateway_peer);
+                try_fail!(cloud.connect(&gateway_peer), "Failed to send message to {}: {}", &gateway_peer);
+                cloud.add_reconnect_peer(gateway_peer.clone());
+                // Add configured peers for mesh discovery through the proxy
+                for mut addr in config.peers.iter().cloned() {
                     let orig = addr.clone();
                     if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
-                        addr = format!("{}:{}", addr, DEFAULT_PORT)
+                        addr = format!("{}:{}", addr, DEFAULT_PORT);
                     }
-                    info!("run_ws: connecting to configured peer orig={} effective={}", orig, addr);
-                    try_fail!(cloud.connect(&addr as &str), "Failed to send message to {}: {}", &addr);
+                    info!("run_ws: adding configured peer for mesh discovery orig={} effective={}", orig, addr);
                     cloud.add_reconnect_peer(addr);
                 }
                 #[cfg(unix)]
@@ -606,7 +843,74 @@ fn main() {
                 if config.daemonize {
                     info!("Daemonize is not supported on this platform");
                 }
-                cloud.run_legacy();
+                // WebSocket proxy mode: run_legacy() returns false when the underlying
+                // socket dies (disconnection). Reconnect the socket and re-establish the
+                // peer connection instead of exiting the process.
+                // Similar to v0.0.5's housekeep(): periodic retry loop instead of one-shot.
+                loop {
+                    let ok = cloud.run_legacy();
+                    if ok {
+                        break;
+                    }
+                    info!("run_ws: WebSocket connection lost, entering reconnect loop...");
+                    
+                    // Retry loop: keep trying every 5 seconds until reconnect succeeds
+                    loop {
+                        info!("run_ws: attempting WebSocket reconnect...");
+                        match cloud.socket_reconnect() {
+                            Ok(_) => {
+                                info!("run_ws: socket reconnected, re-establishing gateway...");
+                                // Update ws_proxy_peer with new address from reconnected socket
+                                if let Ok(new_addr) = cloud.socket_address() {
+                                    ws_proxy_peer = new_addr;
+                                    // Update own_addresses with new proxy port
+                                    let proxy_port = ws_proxy_peer.port();
+                                    let mut own_addrs = Vec::new();
+                                    if let Some(ip_str) = &config.ip {
+                                        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                                            own_addrs.push(SocketAddr::new(ip, proxy_port));
+                                        }
+                                    }
+                                    if let Some(ipv6_str) = &config.ipv6 {
+                                        if let Ok(ipv6) = ipv6_str.parse::<IpAddr>() {
+                                            own_addrs.push(SocketAddr::new(ipv6, proxy_port));
+                                        }
+                                    }
+                                    for addr in &config.advertise_addresses {
+                                        own_addrs.push(addr.parse().unwrap());
+                                    }
+                                    cloud.set_own_addresses(own_addrs);
+                                    info!("run_ws: updated own_addresses with new proxy port {}", proxy_port);
+                                }
+                                let gateway_peer = if !config.peers.is_empty() {
+                                    let mut peer = config.peers[0].clone();
+                                    if peer.find(':').unwrap_or(0) <= peer.find(']').unwrap_or(0) {
+                                        peer = format!("{}:{}", peer, DEFAULT_PORT);
+                                    }
+                                    peer
+                                } else {
+                                    ws_proxy_peer.to_string()
+                                };
+                                match cloud.connect(&gateway_peer) {
+                                    Ok(_) => {
+                                        info!("run_ws: gateway reconnected, resuming event loop");
+                                        break; // Reconnect successful, resume run_legacy loop
+                                    }
+                                    Err(e) => {
+                                        error!("run_ws: failed to reconnect to gateway {}: {}", gateway_peer, e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("run_ws: socket reconnect failed: {}", e);
+                            }
+                        }
+                        // Wait 5 seconds before next retry
+                        info!("run_ws: reconnect failed, retrying in 5 seconds...");
+                        thread::sleep(Duration::from_secs(5));
+                    }
+                    info!("run_ws: reconnect successful, resuming event loop");
+                }
                 if let Some(script) = config.ifdown {
                     run_script(&script, &device_ifname);
                 }
@@ -614,9 +918,11 @@ fn main() {
         }
         return;
     }
+    info!("=== ENTERING REGULAR RUN PATH ===");
     info!("Opening UDP socket for listen={}", config.listen);
     let socket = try_fail!(UdpSocket::listen(&config.listen), "Failed to open socket {}: {}", config.listen);
-    info!("UDP socket opened for listen={}", config.listen);
+    let vpncloud_udp_addr = try_fail!(socket.address(), "Failed to get socket address: {}");
+    info!("UDP socket opened for listen={}, vpncloud UDP address={}", config.listen, vpncloud_udp_addr);
 
     #[cfg(feature = "websocket")]
     if let Some(ref ws_proxy_addr) = config.ws_proxy {
@@ -633,7 +939,7 @@ fn main() {
                 error!("WebSocket proxy error: {}", err);
             }
         });
-        info!("Embedded WebSocket proxy listening on {}", ws_proxy_listen);
+        info!("Embedded WebSocket proxy spawned, listening on {}", ws_proxy_listen);
     }
 
     match config.device_type {

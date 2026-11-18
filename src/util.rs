@@ -178,9 +178,9 @@ macro_rules! fail {
         log::logger().flush();
         process::exit(-1);
     } );
-    ($format:expr, $( $arg:expr ),+) => ( {
+    ($format:expr, $($arg:expr),+) => ( {
         use std::process;
-        error!($format, $( $arg ),+ );
+        error!($format, $( $arg ),+);
         log::logger().flush();
         process::exit(-1);
     } );
@@ -462,6 +462,84 @@ pub fn run_cmd(mut cmd: Command) {
         }
         Err(e) => error!("Failed to execute command {:?}: {}", cmd, e),
     }
+}
+
+/// Get a stable machine identifier for node_id derivation.
+/// Uses platform-specific sources in priority order:
+/// - Linux: /etc/machine-id, /var/lib/dbus/machine-id
+/// - Windows: MachineGuid from registry
+/// - macOS: IOPlatformUUID
+/// - Fallback: hostname + first non-loopback MAC address
+pub fn get_machine_id() -> String {
+    // Linux: machine-id files
+    #[cfg(target_os = "linux")]
+    {
+        for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let id = content.trim();
+                if !id.is_empty() {
+                    return id.to_string();
+                }
+            }
+        }
+    }
+    
+    // Windows: MachineGuid from registry
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        if let Ok(output) = Command::new("reg")
+            .args(["query", "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.contains("MachineGuid") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 3 {
+                        return parts[2].to_string();
+                    }
+                }
+            }
+        }
+    }
+    
+    // macOS: IOPlatformUUID
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        if let Ok(output) = Command::new("ioreg")
+            .args(["-d2", "-c", "IOPlatformExpertDevice"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.contains("IOPlatformUUID") {
+                    let parts: Vec<&str> = line.split('=').collect();
+                    if parts.len() >= 2 {
+                        return parts[1].trim().trim_matches('"').to_string();
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fallback: hostname + first non-loopback MAC
+    let hostname = hostname::get().ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    
+    // Try to get a MAC address
+    let interfaces = netdev::get_interfaces();
+    for iface in interfaces {
+        if !iface.is_loopback() && iface.mac_addr.is_some() {
+            let mac = iface.mac_addr.unwrap();
+            let mac_str = mac.octets().iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+            return format!("{}-{}", hostname, mac_str);
+        }
+    }
+    
+    hostname
 }
 
 #[test]

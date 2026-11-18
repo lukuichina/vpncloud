@@ -26,11 +26,15 @@ pub enum Error {
     #[error("Invalid config: {0}")]
     InvalidConfig(&'static str),
 
-    #[error("Socker error: {0}")]
+    #[error("Socket error: {0}")]
     Socket(&'static str),
 
-    #[error("Socker error: {0} ({1})")]
+    #[error("Socket error: {0} ({1})")]
     SocketIo(&'static str, #[source] io::Error),
+
+    /// Underlying socket/transport closed (e.g., WebSocket proxy disconnected)
+    #[error("Socket closed: {0}")]
+    SocketClosed(&'static str),
 
     #[error("Device error: {0}")]
     Device(String),

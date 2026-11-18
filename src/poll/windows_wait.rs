@@ -30,7 +30,9 @@ impl WindowsWait {
             if ev == 0 {
                 return Err(io::Error::last_os_error());
             }
-            if WSAEventSelect(sock, ev, (FD_READ | FD_CLOSE) as i32) == SOCKET_ERROR {
+            let result = WSAEventSelect(sock, ev, (FD_READ | FD_CLOSE) as i32);
+            info!("WindowsWait::new: socket={:?}, WSAEventSelect result={}", sock, result);
+            if result == SOCKET_ERROR {
                 let e = io::Error::last_os_error();
                 WSACloseEvent(ev);
                 return Err(e);

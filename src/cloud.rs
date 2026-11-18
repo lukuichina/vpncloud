@@ -138,26 +138,50 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             claims.push(try_fail!(Range::from_str(s), "Invalid subnet format: {} ({})", s));
         }
         if device.get_type() == Type::Tun && config.auto_claim {
-            match device.get_ip() {
-                Ok(ip) => {
-                    let prefix_len = match ip {
-                        IpAddr::V4(_) => 32,
-                        IpAddr::V6(_) => 128,
-                    };
+            // Always claim primary configured address if present.
+            if let Some(ref ip_str) = config.ip {
+                if let Ok((ip, _)) = crate::parse_ip_netmask(ip_str) {
+                    let prefix_len = match ip { IpAddr::V4(_) => 32, IpAddr::V6(_) => 128 };
                     let range = Range { base: Address::from_ip(ip), prefix_len };
-                    info!("Auto-claiming {} due to interface address", range);
-                    claims.push(range);
+                    if !claims.iter().any(|c| *c == range) {
+                        info!("Auto-claiming {} due to configured interface address", range);
+                        claims.push(range);
+                    }
                 }
-                Err(Error::DeviceIo(_, e)) if e.kind() == io::ErrorKind::AddrNotAvailable => {
-                    info!("No address set on interface.")
+            }
+            // Also claim additional IPv6 address in dual-stack setups.
+            if let Some(ref ipv6_str) = config.ipv6 {
+                if config.ip.as_ref().map(|s| s != ipv6_str).unwrap_or(true) {
+                    if let Ok((ip, _)) = crate::parse_ip_netmask(ipv6_str) {
+                        let prefix_len = match ip { IpAddr::V4(_) => 32, IpAddr::V6(_) => 128 };
+                        let range = Range { base: Address::from_ip(ip), prefix_len };
+                        if !claims.iter().any(|c| *c == range) {
+                            info!("Auto-claiming {} due to configured IPv6 interface address", range);
+                            claims.push(range);
+                        }
+                    }
                 }
-                Err(e) => error!("{}", e),
+            }
+            // Fallback to device-reported address if nothing configured.
+            if claims.is_empty() {
+                match device.get_ip() {
+                    Ok(ip) => {
+                        let prefix_len = match ip { IpAddr::V4(_) => 32, IpAddr::V6(_) => 128 };
+                        let range = Range { base: Address::from_ip(ip), prefix_len };
+                        info!("Auto-claiming {} due to interface address", range);
+                        claims.push(range);
+                    }
+                    Err(Error::DeviceIo(_, e)) if e.kind() == io::ErrorKind::AddrNotAvailable => {
+                        info!("No address set on interface.")
+                    }
+                    Err(e) => error!("{}", e),
+                }
             }
         }
         let now = TS::now();
         let update_freq = config.get_keepalive() as u16;
-        let node_id = random();
-        let crypto = Crypto::new(node_id, &config.crypto).unwrap();
+        let crypto = Crypto::new(&config.crypto).unwrap();
+        let node_id = crypto.node_id;
         let beacon_key = config.beacon_password.as_ref().map(|s| s.as_bytes()).unwrap_or(&[]);
         let mut res = GenericCloud {
             node_id,
@@ -274,6 +298,18 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         debug!("Own addresses: {:?}", self.own_addresses);
         // TODO: detect address changes and call event
         Ok(())
+    }
+
+    /// Manually set own addresses (for WebSocket mode where socket address is the proxy's address)
+    pub fn set_own_addresses(&mut self, addrs: Vec<SocketAddr>) {
+        self.own_addresses.clear();
+        self.own_addresses.extend(addrs);
+        debug!("Own addresses manually set: {:?}", self.own_addresses);
+    }
+
+    /// Get the socket's local address (for WebSocket reconnect to update own_addresses)
+    pub fn socket_address(&self) -> io::Result<SocketAddr> {
+        self.socket.address()
     }
 
     /// Returns the number of peers
@@ -733,8 +769,14 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         };
 
         if let Some(existing_addr) = existing_addr {
-            // 同一节点，地址已变（SNAT/NAT），更新现有 peer 而不是创建新的
-            if let Some(peer) = self.peers.get_mut(&existing_addr) {
+            // 同一节点，地址已变（SNAT/NAT/重连/WS-proxy新端口）
+            // 必须将 peer 条目从旧地址移动到新地址，并替换 crypto
+            // 否则 routing table 仍指向旧地址，导致重连后数据发往错误地址
+            let mut crypto_replaced = false;
+            let mut new_peer_data: Option<PeerData> = None;
+            
+            if let Some(mut peer) = self.peers.remove(&existing_addr) {
+                // 合并地址列表
                 if !peer.addrs.contains(&addr) {
                     peer.addrs.push(addr);
                 }
@@ -745,13 +787,36 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 }
                 peer.last_seen = TS::now();
                 peer.timeout = TS::now() + self.config.peer_timeout as Time;
+                
+                // 关键：替换 crypto 为新握手产生的状态
+                if let Some(init) = self.pending_inits.remove(&addr) {
+                    if init.is_ready() {
+                        peer.crypto = init;
+                        crypto_replaced = true;
+                        info!("Replaced crypto for peer {} due to address change/reconnect", addr_nice(existing_addr));
+                    }
+                }
+                
+                new_peer_data = Some(peer);
             }
+            
+            // 关键：移除旧地址的 claims，防止 routing table 仍指向旧地址
+            self.table.remove_claims(existing_addr);
+            
+            // 以新地址作为 key 重新插入
+            if let Some(peer_data) = new_peer_data {
+                self.peers.insert(peer_addr, peer_data);
+            }
+            
             info!(
-                "Updated peer {} (was {}) due to address change",
+                "Moved peer {} -> {} due to address change, crypto_replaced={}",
                 addr_nice(existing_addr),
-                addr_nice(addr)
+                addr_nice(peer_addr),
+                crypto_replaced
             );
-            self.update_peer_info(existing_addr, Some(info))?;
+            
+            // 使用新地址更新 routing table
+            self.update_peer_info(peer_addr, Some(info))?;
         } else {
             info!("Added peer {}", addr_nice(peer_addr));
             self.config.call_hook(
@@ -998,6 +1063,22 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         let src = mapped_addr(src);
         let mut effective_src = src;
         debug!("Received {} bytes from {}", data.len(), src);
+
+        // Defensive: reject packets too short for any valid message (init or encrypted)
+        // Init messages need at least 1 byte (type); encrypted messages need EXTRA_LEN + TAG_LEN
+        const MIN_ENCRYPTED_LEN: usize = 9 + 16; // EXTRA_LEN + TAG_LEN
+        if data.is_empty() || (!is_init_message(data.message()) && data.len() < MIN_ENCRYPTED_LEN) {
+            debug!(
+                "Dropping short packet from {}: len={}, min_encrypted={}, is_init={}",
+                src,
+                data.len(),
+                MIN_ENCRYPTED_LEN,
+                is_init_message(data.message())
+            );
+            self.traffic.count_invalid_protocol(data.len());
+            return Err(Error::Message("Packet too short"));
+        }
+
         let msg_result = if let Some(init) = self.pending_inits.get_mut(&src) {
             // COLD PATH
             debug!("Dispatch: using pending init state for {}", addr_nice(src));
@@ -1019,22 +1100,39 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     debug!("Dispatch: existing peer {} has no crypto init and not ready", addr_nice(src));
                 }
             }
-            // When allow_snat is false, try SNAT/NAT address change handling during
-            // handshake/init window: accept the currently observed transport source as a
-            // legitimate initial endpoint (NAT/SNAT rewrite) and make replies follow src.
-            // This does NOT permit arbitrary drift after an established session.
-            if result.is_none() && !ignore_duplicate_init && !self.config.allow_snat {
-                // Pending inits: try to match by crypto state. On match, rebind the init
-                // entry to the observed src so all subsequent replies follow the real path.
-                let mut pending_match: Option<(SocketAddr, MessageResult<NodeInfo>, MsgBuffer)> = None;
-                for (addr, init) in self.pending_inits.iter_mut() {
-                    let mut test = data.clone();
-                    if let Ok(msg_result) = init.handle_message(&mut test) {
-                        pending_match = Some((*addr, msg_result, test));
-                        break;
+            // During handshake/init window, always try SNAT/NAT address change handling.
+            // For init messages (handshake), use heuristic: if any pending init exists,
+            // assume it's the same peer (WebSocket proxy / NAT case).
+            // For non-init messages, use crypto state matching.
+            let is_init = is_init_message(data.message());
+            if result.is_none() && !ignore_duplicate_init && (is_init || !self.config.allow_snat) {
+                let mut matched_addr: Option<SocketAddr> = None;
+                if is_init {
+                    // Heuristic: any pending init = WebSocket proxy / NAT (single peer case)
+                    if !self.pending_inits.is_empty() {
+                        if let Some((addr, _)) = self.pending_inits.iter().next() {
+                            debug!(
+                                "SNAT/NAT heuristic match (any pending init): {} -> {}",
+                                addr_nice(*addr),
+                                addr_nice(src)
+                            );
+                            matched_addr = Some(*addr);
+                        }
+                    }
+                } else {
+                    // For non-init messages, use crypto state matching (original logic)
+                    for (addr, init) in self.pending_inits.iter_mut() {
+                        if data.len() < MIN_ENCRYPTED_LEN {
+                            continue;
+                        }
+                        let mut test = data.clone();
+                        if init.handle_message(&mut test).is_ok() {
+                            matched_addr = Some(*addr);
+                            break;
+                        }
                     }
                 }
-                if let Some((matched_addr, msg_result, mut decrypted_data)) = pending_match {
+                if let Some(matched_addr) = matched_addr {
                     if matched_addr != src {
                         debug!(
                             "SNAT/NAT handshake rebind for pending init: {} -> {}",
@@ -1046,12 +1144,21 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                         }
                     }
                     effective_src = src;
-                    self.handle_message(src, msg_result, &mut decrypted_data)?;
+                    // Process the message on the rebound init and send reply if needed
+                    if let Some(init) = self.pending_inits.get_mut(&src) {
+                        if let Ok(res) = init.handle_message(data) {
+                            self.handle_message(src, res, data)?;
+                        }
+                    }
                     return Ok(());
                 }
                 // Existing peer still in init/handshake state: reply to observed src during init window.
                 for (addr, peer) in self.peers.iter_mut() {
                     if peer.crypto.has_init() {
+                        // Skip short packets that can't possibly decrypt
+                        if data.len() < MIN_ENCRYPTED_LEN && !is_init {
+                            continue;
+                        }
                         let mut test = data.clone();
                         if let Ok(msg_result) = peer.crypto.handle_message(&mut test) {
                             if *addr != src {
@@ -1080,6 +1187,12 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 result
             } else {
                 debug!("Dispatch: creating new pending init for {}", addr_nice(src));
+                // Skip short packets that can't possibly be valid init messages
+                if data.is_empty() {
+                    debug!("Dropping empty packet from {}", src);
+                    self.traffic.count_invalid_protocol(0);
+                    return Err(Error::Message("Empty packet"));
+                }
                 let mut init = self.crypto.peer_instance(self.create_node_info());
                 let msg_result = init.handle_message(data);
                 match msg_result {
@@ -1189,7 +1302,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         }
     }
 
-    fn handle_socket_event(&mut self, buffer: &mut MsgBuffer, first: Option<crate::channel_io::NetPacket>) -> bool {
+    fn handle_socket_event(&mut self, buffer: &mut MsgBuffer, first: Option<crate::channel_io::NetPacket>) -> Result<bool, Error> {
         // HOT PATH
         let socket_pending = self.socket.pending();
         if socket_pending > 100 {
@@ -1214,7 +1327,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                         use std::io::ErrorKind;
                         if e.kind() == ErrorKind::WouldBlock {
                             // WSAEWOULDBLOCK / channel empty - no more data, drain done
-                            return drained_packets > 0;
+                            return Ok(drained_packets > 0);
                         }
                         // On Windows UDP sockets, recvfrom may report prior ICMP errors (e.g. port
                         // unreachable) as WSAECONNRESET(10054)/WSAECONNREFUSED(10061). Treat as
@@ -1222,11 +1335,11 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                         if let Some(code) = e.raw_os_error() {
                             if code == 10054 || code == 10061 {
                                 warn!("Transient UDP recv error (os error {}), likely ICMP unreachable/refused for a previous send; continuing: {}", code, e);
-                                return drained_packets > 0;
+                                return Ok(drained_packets > 0);
                             }
                             if code == 10035 {
                                 // WSAEWOULDBLOCK - no more data, drain done
-                                return drained_packets > 0;
+                                return Ok(drained_packets > 0);
                             }
                         }
                     }
@@ -1235,12 +1348,24 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                         use std::io::ErrorKind;
                         if e.kind() == ErrorKind::WouldBlock {
                             // EAGAIN/EWOULDBLOCK - no more data, drain done
-                            return drained_packets > 0;
+                            return Ok(drained_packets > 0);
                         }
+                    }
+                    // Check if this is a WebSocket connection closed error
+                    // (e.g., "Trying to work with closed connection" or "Connection reset")
+                    let err_str = e.to_string();
+                    if err_str.contains("Trying to work with closed connection")
+                        || err_str.contains("Connection reset")
+                        || err_str.contains("Connection closed")
+                        || err_str.contains("WebSocket connection closed")
+                        || err_str.contains("Connection aborted")
+                    {
+                        info!("WebSocket connection closed detected: {}, signaling reconnect", err_str);
+                        return Err(Error::SocketClosed("WebSocket connection closed"));
                     }
                     error!("Failed to read from network socket: {}", e);
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                    return drained_packets > 0;
+                    return Ok(drained_packets > 0);
                 }
             }
             };
@@ -1301,14 +1426,16 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             }
 
             // Safety bound: avoid monopolizing the single-threaded loop when socket is very busy.
-            if drained_packets >= 64 || t_ev.elapsed().as_micros() >= 20_000 {
+            const MAX_DRAIN_PACKETS: u64 = 1024;
+            if drained_packets >= MAX_DRAIN_PACKETS || t_ev.elapsed().as_micros() >= 50_000 {
                 warn!(
                     "[SOCKET_EVT_DRAIN] break early drained_packets={} drained_bytes={} total_us={}",
                     drained_packets, drained_bytes, t_ev.elapsed().as_micros()
                 );
-                return true;
+                return Ok(true);
             }
         }
+        Ok(drained_packets > 0)
     }
 
     fn handle_device_event(&mut self, buffer: &mut MsgBuffer, first: Option<Vec<u8>>) -> bool {
@@ -1358,7 +1485,8 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     }
 
                     // Safety bound: avoid monopolizing the main loop when TUN is very busy.
-                    if drained_packets >= 64 || total_us >= 20_000 {
+                    const MAX_DRAIN_PACKETS: u64 = 1024;
+                    if drained_packets >= MAX_DRAIN_PACKETS || total_us >= 50_000 {
                         warn!(
                             "[DEVICE_EVT_DRAIN] break early drained_packets={} drained_bytes={} total_us={}",
                             drained_packets, drained_bytes, total_us
@@ -1420,7 +1548,13 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             last_event_ts = now_ts;
 
             // Drain all available network/device packets.
-            let socket_drained = self.handle_socket_event(&mut buffer, None);
+            let socket_drained = match self.handle_socket_event(&mut buffer, None) {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("Cloud::run: socket event error: {}", e);
+                    false
+                }
+            };
             let device_drained = self.handle_device_event(&mut buffer, None);
 
             if !socket_drained && !device_drained {
@@ -1440,14 +1574,18 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     crossbeam_channel::select! {
                         recv(nrx) -> msg => {
                             if let Ok(pkt) = msg {
-                                self.handle_socket_event(&mut buffer, Some(pkt));
+                                if let Err(e) = self.handle_socket_event(&mut buffer, Some(pkt)) {
+                                    error!("Cloud::run: socket event error: {}", e);
+                                }
                                 self.handle_device_event(&mut buffer, None);
                             }
                         },
                         recv(drx) -> msg => {
                             if let Ok(data) = msg {
                                 self.handle_device_event(&mut buffer, Some(data));
-                                self.handle_socket_event(&mut buffer, None);
+                                if let Err(e) = self.handle_socket_event(&mut buffer, None) {
+                                    error!("Cloud::run: socket event error: {}", e);
+                                }
                             }
                         },
                         default(std::time::Duration::from_millis(wait_ms)) => {},
@@ -1493,29 +1631,55 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     /// Single-threaded event loop using WaitImpl (epoll/WSAEvent+WFMO).
     /// Used as the native fast path (direct nonblocking UDP socket + TUN/Wintun)
     /// and as the fallback path for websocket-proxy connections.
-    pub fn run_legacy(&mut self) {
+    ///
+    /// Returns `true` if the event loop exited normally (Ctrl-C or clean shutdown),
+    /// `false` if the underlying socket died unexpectedly (e.g. WebSocket proxy
+    /// disconnected). Callers can use this to trigger a reconnect.
+    pub fn run_legacy(&mut self) -> bool {
         info!("Cloud::run_legacy: starting single-thread event loop, ifname={}", self.device.ifname());
         let ctrlc = CtrlC::new();
         let poll_timeout_ms = self.config.poll_timeout_ms;
         info!("Cloud::run_legacy: wait timeout = {} ms", poll_timeout_ms);
+
         #[cfg(unix)]
-        let waiter = try_fail!(
-            WaitImpl::new(self.socket.as_raw_fd(), self.device.as_raw_fd(), poll_timeout_ms),
-            "Failed to setup poll: {}"
-        );
+        let waiter = {
+            let socket_fd = self.socket.as_raw_fd();
+            let device_fd = self.device.as_raw_fd();
+            info!("Cloud::run_legacy: socket_fd={}, device_fd={}", socket_fd, device_fd);
+            try_fail!(
+                WaitImpl::new(socket_fd, device_fd, poll_timeout_ms),
+                "Failed to setup poll: {}"
+            )
+        };
         #[cfg(windows)]
-        let waiter = try_fail!(
-            WaitImpl::new(self.socket.as_raw_socket(), self.device.as_raw_socket(), poll_timeout_ms),
-            "Failed to setup poll: {}"
-        );
+        let waiter = {
+            let sock = self.socket.as_raw_socket();
+            let dev = self.device.as_raw_socket();
+            info!("Cloud::run_legacy: socket={:?}, device={:?}", sock, dev);
+            try_fail!(
+                WaitImpl::new(sock, dev, poll_timeout_ms),
+                "Failed to setup poll: {}"
+            )
+        };
+
         info!("Cloud::run_legacy: poll/waiter initialized, entering main loop");
         let mut buffer = MsgBuffer::new(SPACE_BEFORE);
         let mut poll_error = false;
         let mut event_count: u64 = 0;
         let mut last_event_ts = TS::now();
         self.config.call_hook("vpn_started", vec![("IFNAME", self.device.ifname())], true);
-        for evt in waiter {
-            // HOT PATH
+        let mut waiter_iter = waiter;
+        loop {
+            // HOT PATH: get next event (may block)
+            let evt = match waiter_iter.next() {
+                Some(e) => e,
+                None => {
+                    // Waiter exhausted: underlying socket/fd closed (e.g. WebSocket proxy
+                    // disconnected). Signal caller to reconnect rather than exiting.
+                    info!("Cloud::run_legacy: waiter exhausted (socket closed), returning for reconnect");
+                    return false;
+                }
+            };
             event_count += 1;
             let now_ts = TS::now();
             let since_last_ms = (now_ts - last_event_ts) as i64;
@@ -1526,28 +1690,62 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 warn!("Cloud::run_legacy: long gap between loop iterations event #{} {:?} since_last_ms={}", event_count, evt, since_last_ms);
             }
             last_event_ts = now_ts;
-            match evt {
-                WaitResult::Error(err) => {
-                    // COLD PATH
-                    if poll_error {
-                        fail!("Poll wait failed again: {}", err);
+
+            // Priority: process all ready Socket events before Device events.
+            // This ensures crypto handshakes, keepalives, and ACKs are not delayed by TUN drain.
+            let mut current_evt = Some(evt);
+            while let Some(e) = current_evt.take() {
+                match e {
+                    WaitResult::Error(err) => {
+                        // COLD PATH
+                        // On WebSocket proxy mode, a poll error means the underlying
+                        // TCP/WebSocket connection died. Return to caller for reconnect
+                        // instead of exiting the process.
+                        error!("Cloud::run_legacy: poll/socket error: {} (returning for reconnect)", err);
+                        return false;
                     }
-                    debug!("Poll wait failed: {}, retrying...", err);
-                    poll_error = true;
+                    WaitResult::Timeout => {}
+                    WaitResult::Socket => {
+                        match self.handle_socket_event(&mut buffer, None) {
+                            Ok(_) => {
+                                // After handling socket, check if more socket data is immediately available
+                                // by peeking the socket channel without blocking.
+                                if self.socket.pending() > 0 {
+                                    continue; // process next socket event in this inner loop
+                                }
+                            }
+                            Err(Error::SocketClosed(_)) => {
+                                // WebSocket connection closed - signal caller to reconnect
+                                info!("Cloud::run_legacy: WebSocket connection closed, returning for reconnect");
+                                return false;
+                            }
+                            Err(e) => {
+                                // Other errors - log and continue
+                                error!("Cloud::run_legacy: socket event error: {}", e);
+                            }
+                        }
+                    }
+                    WaitResult::Device => {
+                        self.handle_device_event(&mut buffer, None);
+                        // After device, check if socket has pending events before next poll
+                        if self.socket.pending() > 0 {
+                            continue; // process socket event next
+                        }
+                    }
                 }
-                WaitResult::Timeout => {}
-                WaitResult::Socket => {
-                    self.handle_socket_event(&mut buffer, None);
-                }
-                WaitResult::Device => {
-                    self.handle_device_event(&mut buffer, None);
-                }
+                // Get next event from waiter (may block) for inner loop
+                current_evt = waiter_iter.next();
             }
+
+            // Periodic housekeep: reconnect peers, crypto housekeep, beacon, stats, etc.
+            // Runs every second (matching v0.0.5 behaviour) so that reconnect logic
+            // is active even in the single-threaded run_legacy path.
             if self.next_housekeep < TS::now() {
                 // COLD PATH
                 poll_error = false;
                 if ctrlc.was_pressed() {
-                    break;
+                    info!("Cloud::run_legacy: Ctrl-C pressed, shutting down");
+                    return true;
                 }
                 if let Err(e) = self.housekeep() {
                     error!("{}", e)
@@ -1555,19 +1753,26 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 self.next_housekeep = TS::now() + 1
             }
         }
-        info!("Shutting down...");
-        self.config.call_hook("vpn_shutdown", vec![("IFNAME", self.device.ifname())], true);
-        buffer.clear();
-        self.broadcast_msg(MESSAGE_TYPE_CLOSE, &mut buffer).ok();
-        if let Some(ref path) = self.config.beacon_store {
-            let path = Path::new(path);
-            if path.exists() {
-                info!("Removing beacon file");
-                if let Err(e) = fs::remove_file(path) {
-                    error!("Failed to remove beacon file: {}", e)
-                }
-            }
+    }
+
+    /// Re-establish the underlying transport connection after a disconnection.
+    /// Calls the Socket trait's reconnect() method (no-op for plain UDP sockets,
+    /// WebSocket reconnect for ProxyConnection), then clears stale peer state
+    /// and flushes receive buffers so the next housekeep()/connect() cycle
+    /// re-establishes the connection with a clean slate.
+    pub fn socket_reconnect(&mut self) -> Result<(), Error> {
+        info!("GenericCloud::socket_reconnect: reconnecting underlying socket");
+        self.socket.reconnect().map_err(|e| Error::SocketIo("socket reconnect", e))?;
+        // Flush receive buffer to discard stale packets accumulated during disconnection
+        if let Err(e) = self.socket.flush_receive_buffer() {
+            warn!("GenericCloud::socket_reconnect: failed to flush receive buffer: {}", e);
         }
+        // Clear all peers and pending inits so the next housekeep()/connect() cycle
+        // re-establishes the connection with the freshly connected proxy.
+        self.peers.clear();
+        self.pending_inits.clear();
+        self.table.clear();
+        Ok(())
     }
 }
 

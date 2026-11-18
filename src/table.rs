@@ -47,6 +47,14 @@ impl<TS: TimeSource> ClaimTable<TS> {
         self.cache.clear()
     }
 
+    /// Remove all cached routes and claims. Used when the underlying transport
+    /// is reconnected (e.g. WebSocket proxy reconnection) so stale peer
+    /// references do not survive across the new connection.
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.claims.clear();
+    }
+
     pub fn set_claims(&mut self, peer: SocketAddr, mut claims: RangeList) {
         let mut removed_claim = false;
         for entry in &mut self.claims {

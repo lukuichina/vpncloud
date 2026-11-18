@@ -618,11 +618,20 @@ impl<P: Payload> InitState<P> {
                 return Ok(InitResult::Continue);
             } else {
                 // SNAT/NAT 可能导致消息源地址改写，导致 pending_inits key 不匹配。
-                // 接受当前 stage 并重置状态，允许从任意 stage 重新开始握手。
-                debug!("Init stage mismatch (got={}, expected={}): accepting stage and resetting state", stage, self.next_stage);
-                self.next_stage = stage;
-                self.last_message = None;
-                self.ecdh_private_key = None;
+                // 关键修复：如果是发起方（next_stage == STAGE_PONG）收到 PONG (stage 2)，
+                // 说明对端已响应，应保留 ECDH 密钥并继续派生主密钥，不应重置状态。
+                // 即使 ecdh_private_key 已为 None（被前序调用消耗），也应保持 next_stage 以便后续重试。
+                if self.next_stage == STAGE_PONG && stage == STAGE_PONG {
+                    debug!("Init stage mismatch: initiator received PONG, preserving state to derive master secret");
+                    self.next_stage = stage;
+                    self.last_message = None;
+                    // Do NOT reset ecdh_private_key here; if already consumed, handshake will retry
+                } else {
+                    debug!("Init stage mismatch (got={}, expected={}): accepting stage and resetting state", stage, self.next_stage);
+                    self.next_stage = stage;
+                    self.last_message = None;
+                    self.ecdh_private_key = None;
+                }
             }
         }
         self.failed_retries = 0;
