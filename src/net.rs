@@ -66,6 +66,29 @@ pub fn get_ip_v6() -> Option<Ipv6Addr> {
     None
 }
 
+/// Determine the local source IP the kernel would use to reach `dst`, by
+/// connecting an ephemeral UDP socket to it (this only sets the default peer
+/// and resolves the route via the kernel routing table — no packets are sent).
+///
+/// This is the key to correct advertisement on multi-homed hosts (LAN + netbird
+/// `wt0` + public IPv6, etc.): a single `get_ip()` value (derived from the route
+/// to 8.8.8.8) may be unreachable from some peers, whereas the per-peer source
+/// IP is exactly the address the peer will see us coming from.
+pub fn local_ip_for(dst: SocketAddr) -> Option<IpAddr> {
+    let bind: SocketAddr = if dst.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+    };
+    let s = UdpSocket::bind(bind).ok()?;
+    s.connect(dst).ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() {
+        return None;
+    }
+    Some(ip)
+}
+
 #[cfg(unix)]
 pub trait Socket: AsRawFd + Sized {
     fn listen(addr: &str) -> Result<Self, io::Error>;

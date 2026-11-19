@@ -4,23 +4,26 @@
 
 use fnv::FnvHasher;
 use std::{
-    cmp::min, collections::HashMap, hash::BuildHasherDefault, io, io::Write, marker::PhantomData, net::SocketAddr,
+    cmp::min, collections::HashMap, hash::BuildHasherDefault, io, io::Write, marker::PhantomData,
 };
 
 use crate::{
-    types::{Address, Range, RangeList},
-    util::{addr_nice, Duration, Time, TimeSource},
+    types::{Address, NodeId, Range, RangeList},
+    util::{bytes_to_hex, Duration, Time, TimeSource},
 };
 
 type Hash = BuildHasherDefault<FnvHasher>;
 
+// Peers are identified by their stable NodeId (public-key fingerprint), NOT by
+// SocketAddr. A peer's endpoint may change (NAT/SNAT/multi-homed/mobile); claims
+// and cached routes therefore belong to the NodeId and survive address changes.
 struct CacheValue {
-    peer: SocketAddr,
+    peer: NodeId,
     timeout: Time,
 }
 
 struct ClaimEntry {
-    peer: SocketAddr,
+    peer: NodeId,
     claim: Range,
     timeout: Time,
 }
@@ -38,7 +41,7 @@ impl<TS: TimeSource> ClaimTable<TS> {
         Self { cache: HashMap::default(), cache_timeout, claims: vec![], claim_timeout, _dummy: PhantomData }
     }
 
-    pub fn cache(&mut self, addr: Address, peer: SocketAddr) {
+    pub fn cache(&mut self, addr: Address, peer: NodeId) {
         // HOT PATH
         self.cache.insert(addr, CacheValue { peer, timeout: TS::now() + self.cache_timeout as Time });
     }
@@ -55,7 +58,7 @@ impl<TS: TimeSource> ClaimTable<TS> {
         self.claims.clear();
     }
 
-    pub fn set_claims(&mut self, peer: SocketAddr, mut claims: RangeList) {
+    pub fn set_claims(&mut self, peer: NodeId, mut claims: RangeList) {
         let mut removed_claim = false;
         for entry in &mut self.claims {
             if entry.peer == peer {
@@ -85,7 +88,7 @@ impl<TS: TimeSource> ClaimTable<TS> {
         self.housekeep()
     }
 
-    pub fn remove_claims(&mut self, peer: SocketAddr) {
+    pub fn remove_claims(&mut self, peer: NodeId) {
         for entry in &mut self.claims {
             if entry.peer == peer {
                 entry.timeout = 0
@@ -101,7 +104,7 @@ impl<TS: TimeSource> ClaimTable<TS> {
 
     /// Refresh the timeout of all claims belonging to `peer`, keeping them alive
     /// when traffic flows but no new NodeInfo exchange happens.
-    pub fn refresh_claims_timeout(&mut self, peer: SocketAddr) {
+    pub fn refresh_claims_timeout(&mut self, peer: NodeId) {
         let now = TS::now();
         for entry in &mut self.claims {
             if entry.peer == peer {
@@ -111,7 +114,7 @@ impl<TS: TimeSource> ClaimTable<TS> {
         self.housekeep()
     }
 
-    pub fn lookup(&mut self, addr: Address) -> Option<SocketAddr> {
+    pub fn lookup(&mut self, addr: Address) -> Option<NodeId> {
         // HOT PATH
         if let Some(entry) = self.cache.get(&addr) {
             return Some(entry.peer);
@@ -157,9 +160,9 @@ impl<TS: TimeSource> ClaimTable<TS> {
         for entry in &self.claims {
             writeln!(
                 out,
-                "    - \"{}\": {{ peer: \"{}\", timeout: {} }}",
+                "    - \"{}\": {{ peer: \"node:{}\", timeout: {} }}",
                 entry.claim,
-                addr_nice(entry.peer),
+                bytes_to_hex(&entry.peer),
                 entry.timeout - now
             )?;
         }
@@ -167,9 +170,9 @@ impl<TS: TimeSource> ClaimTable<TS> {
         for (addr, entry) in &self.cache {
             writeln!(
                 out,
-                "    - \"{}\": {{ peer: \"{}\", timeout: {} }}",
+                "    - \"{}\": {{ peer: \"node:{}\", timeout: {} }}",
                 addr,
-                addr_nice(entry.peer),
+                bytes_to_hex(&entry.peer),
                 entry.timeout - now
             )?;
         }

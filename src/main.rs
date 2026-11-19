@@ -182,7 +182,7 @@ fn setup_device(config: &Config) -> TunTapDevice {
     );
     info!("Opened device {}", device.ifname());
     config.call_hook("device_setup", vec![("IFNAME", device.ifname())], true);
-    if let Err(err) = device.set_mtu(None) {
+    if let Err(err) = device.set_mtu(config.mtu) {
         error!("Error setting optimal MTU on {}: {}", device.ifname(), err);
     }
     // Configure interface addresses. Support dual-stack by applying --ip and, when
@@ -435,6 +435,32 @@ fn main() {
     unsafe {
         windows_sys::Win32::Media::timeBeginPeriod(1);
     }
+    #[cfg(windows)]
+    {
+        // Ensure timeEndPeriod is called on exit so the timer resolution
+        // is restored and other processes are not affected.
+        let _guard = TimerGuard;
+        run_inner();
+    }
+    #[cfg(not(windows))]
+    {
+        run_inner();
+    }
+}
+
+/// RAII guard that calls timeEndPeriod(1) on drop.
+#[cfg(windows)]
+struct TimerGuard;
+#[cfg(windows)]
+impl Drop for TimerGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Media::timeEndPeriod(1);
+        }
+    }
+}
+
+fn run_inner() {
     let args: Args = Args::from_args();
     if args.version {
         println!("VpnCloud v{}", env!("CARGO_PKG_VERSION"));

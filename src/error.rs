@@ -6,6 +6,21 @@ use thiserror::Error;
 
 use std::io;
 
+/// Returns true when an I/O error means the destination is definitively
+/// unreachable (no route / host down / address not available), as opposed to a
+/// transient condition. Used to decide whether to give up on a direct peer
+/// endpoint and fall back to relaying through another peer.
+pub fn io_unreachable(err: &io::Error) -> bool {
+    match err.raw_os_error() {
+        Some(101) | Some(113) | Some(99) => true, // Linux ENETUNREACH / EHOSTUNREACH / EADDRNOTAVAIL
+        Some(10051) | Some(10065) | Some(10049) => true, // Windows WSAENETUNREACH / WSAEHOSTUNREACH / WSAEADDRNOTAVAIL
+        _ => matches!(
+            err.kind(),
+            io::ErrorKind::AddrNotAvailable | io::ErrorKind::NotConnected
+        ),
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     /// Crypto init error, this is recoverable
@@ -56,4 +71,14 @@ pub enum Error {
 
     #[error("Name can not be resolved: {0}")]
     NameUnresolvable(String),
+}
+
+impl Error {
+    /// True if this error is a definitive "destination unreachable" socket error.
+    pub fn is_unreachable(&self) -> bool {
+        match self {
+            Error::SocketIo(_, e) => io_unreachable(e),
+            _ => false,
+        }
+    }
 }

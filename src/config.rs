@@ -5,11 +5,17 @@
 use super::{device::Type, types::Mode, util::run_cmd, util::Duration};
 pub use crate::crypto::Config as CryptoConfig;
 
-use std::{cmp::max, collections::HashMap, ffi::OsStr, process, thread};
+use std::{cmp::{max, min}, collections::HashMap, ffi::OsStr, process, thread};
 use structopt::{clap::Shell, StructOpt};
 
-pub const DEFAULT_PEER_TIMEOUT: u16 = 300;
+pub const DEFAULT_PEER_TIMEOUT: u16 = 3600;
 pub const DEFAULT_PORT: u16 = 3210;
+/// Upper bound (seconds) for the derived keepalive interval. Without this cap a
+/// large peer-timeout (e.g. 3600s) yields a ~29-minute keepalive, so a peer that
+/// silently restarts (losing all state) is not noticed until far too late. A
+/// short keepalive makes the restarted side self-heal quickly via the
+/// "non-init message from unknown peer" path.
+pub const KEEPALIVE_MAX: Duration = 10;
 
 #[derive(Deserialize, Debug, PartialEq, Clone)]
 pub struct Config {
@@ -25,6 +31,11 @@ pub struct Config {
     /// --sni overrides the TLS SNI and HTTP Host header to this value.
     pub sni: Option<String>,
     pub advertise_addresses: Vec<String>,
+    /// When true, actively enumerate local ACTIVE network cards' IPv4/IPv6
+    /// unicast addresses in reset_own_addresses() and advertise them,
+    /// filtering out our own virtual tunnel interface (vpncloud0) to avoid
+    /// advertising the tunnel IPs back to peers (self-loop).
+    pub advertise_auto: bool,
     pub ifup: Option<String>,
     pub ifdown: Option<String>,
 
@@ -48,6 +59,15 @@ pub struct Config {
     pub poll_timeout_ms: u32,
     /// Allow SNAT/NAT address change handling (default: true). When false, use new SNAT peer matching logic.
     pub allow_snat: bool,
+    /// Do not dial peers learned via peer-list gossip. When true, this node only
+    /// keeps connections it explicitly initiated (--connect) and lets the hub's
+    /// broad claims route inter-node traffic through the hub (star topology).
+    pub no_direct_peers: bool,
+    /// MTU for the virtual TUN/TAP interface. When None, MTU is derived
+    /// automatically from the default route MTU minus crypto/encapsulation overhead.
+    /// On Windows, a fixed MTU (e.g. 1380) is recommended to avoid IP fragmentation
+    /// when traffic passes through WebSocket + cloudflared (HTTP/2 / QUIC).
+    pub mtu: Option<usize>,
     pub claims: Vec<String>,
     pub auto_claim: bool,
     pub port_forwarding: bool,
@@ -73,6 +93,7 @@ impl Default for Config {
             ipv6: None,
             sni: None,
             advertise_addresses: vec![],
+            advertise_auto: false,
             ifup: None,
             ifdown: None,
             crypto: CryptoConfig::default(),
@@ -90,6 +111,8 @@ impl Default for Config {
             switch_timeout: 300,
             poll_timeout_ms: 50,
             allow_snat: true,
+            no_direct_peers: false,
+            mtu: None,
             claims: vec![],
             auto_claim: true,
             port_forwarding: true,
@@ -221,6 +244,9 @@ impl Config {
         if !file.crypto.algorithms.is_empty() {
             self.crypto.algorithms = file.crypto.algorithms.clone();
         }
+        if file.crypto.rotate_interval != 0 {
+            self.crypto.rotate_interval = file.crypto.rotate_interval;
+        }
         if let Some(val) = file.hook {
             self.hook = Some(val)
         }
@@ -255,6 +281,9 @@ impl Config {
             self.ifup = Some(val);
         }
         self.advertise_addresses.append(&mut args.advertise_addresses);
+        if args.advertise_auto {
+            self.advertise_auto = true;
+        }
         if let Some(val) = args.ifdown {
             self.ifdown = Some(val);
         }
@@ -292,8 +321,17 @@ impl Config {
         if let Some(val) = args.poll_timeout_ms {
             self.poll_timeout_ms = val;
         }
+        if let Some(val) = args.rotate_interval {
+            self.crypto.rotate_interval = val;
+        }
         if let Some(false) = args.allow_snat {
             self.allow_snat = false;
+        }
+        if args.no_direct_peers {
+            self.no_direct_peers = true;
+        }
+        if let Some(val) = args.mtu {
+            self.mtu = Some(val);
         }
         self.claims.append(&mut args.claims);
         if args.no_auto_claim {
@@ -396,7 +434,7 @@ impl Config {
     pub fn get_keepalive(&self) -> Duration {
         match self.keepalive {
             Some(dur) => dur,
-            None => max(self.peer_timeout / 2 - 60, 1),
+            None => min(max(self.peer_timeout / 2 - 60, 1), KEEPALIVE_MAX),
         }
     }
 
@@ -475,6 +513,10 @@ pub struct Args {
     #[structopt(long)]
     pub no_auto_claim: bool,
 
+    /// Do not dial peers learned via peer-list gossip (force star topology via hub)
+    #[structopt(long = "no-direct-peers")]
+    pub no_direct_peers: bool,
+
     /// Name of the virtual device
     #[structopt(short, long)]
     pub device: Option<String>,
@@ -507,9 +549,21 @@ pub struct Args {
     #[structopt(long)]
     pub poll_timeout_ms: Option<u32>,
 
+    /// Key rotation interval in seconds (0 = disabled). Lets you toggle periodic
+    /// rekeying at runtime without recompiling.
+    #[structopt(long)]
+    pub rotate_interval: Option<usize>,
+
     /// Allow SNAT/NAT address change handling (default: true). Use --allow-snat=false to disable.
     #[structopt(long)]
     pub allow_snat: Option<bool>,
+
+    /// MTU for the virtual TUN/TAP interface (e.g. --mtu 1380).
+    /// When omitted, MTU is derived automatically from the default route MTU
+    /// minus crypto/encapsulation overhead. On Windows, a fixed MTU of 1380
+    /// is recommended to avoid IP fragmentation through WebSocket + cloudflared.
+    #[structopt(long)]
+    pub mtu: Option<usize>,
 
     /// The file path or |command to store the beacon
     #[structopt(long)]
@@ -551,6 +605,11 @@ pub struct Args {
     /// A list of IP Addresses to advertise as our external address(s)
     #[structopt(long = "advertise_addresses", use_delimiter = true)]
     pub advertise_addresses: Vec<String>,
+
+    /// Automatically enumerate local active network cards' IPv4/IPv6 unicast
+    /// addresses and advertise them (excludes the vpncloud virtual interface).
+    #[structopt(long = "advertise_auto")]
+    pub advertise_auto: bool,
 
     /// A command to setup the network interface
     #[structopt(long)]
@@ -869,6 +928,7 @@ fn config_merge() {
             ipv6: None,
             sni: None,
             advertise_addresses: vec![],
+            advertise_auto: false,
             ifup: Some("ifconfig $IFNAME 10.0.1.1/16 mtu 1400 up".to_string()),
             ifdown: Some("true".to_string()),
             listen: "3210".to_string(),
@@ -931,6 +991,8 @@ fn config_merge() {
             ipv6: None,
             sni: None,
             advertise_addresses: vec![],
+            advertise_auto: false,
+            mtu: None,
 
             ifup: Some("ifconfig $IFNAME 10.0.1.2/16 mtu 1400 up".to_string()),
             ifdown: Some("ifconfig $IFNAME down".to_string()),
@@ -965,6 +1027,7 @@ fn config_merge() {
             insecure: false,
             poll_timeout_ms: 50,
             allow_snat: true,
+            no_direct_peers: false,
         }
     );
 }

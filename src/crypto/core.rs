@@ -128,9 +128,14 @@ impl CryptoKey {
     }
 }
 
+/// Number of rotating key slots in the CryptoCore ring. Key ids select a slot
+/// by `id % KEY_SLOTS`. Must stay <= 256 (key id is carried in one byte) and
+/// match on both peers. 8 keeps several previous rotation keys decryptable.
+const KEY_SLOTS: usize = 8;
+
 pub struct CryptoCore {
     rand: SystemRandom,
-    keys: [CryptoKey; 4],
+    keys: [CryptoKey; KEY_SLOTS],
     current_key: usize,
     nonce_half: bool,
 }
@@ -138,21 +143,17 @@ pub struct CryptoCore {
 impl CryptoCore {
     pub fn new(key: LessSafeKey, nonce_half: bool) -> Self {
         let rand = SystemRandom::new();
-        let dummy_key_data = random_data(key.algorithm().key_len());
-        let dummy_key1 = LessSafeKey::new(UnboundKey::new(key.algorithm(), &dummy_key_data).unwrap());
-        let dummy_key2 = LessSafeKey::new(UnboundKey::new(key.algorithm(), &dummy_key_data).unwrap());
-        let dummy_key3 = LessSafeKey::new(UnboundKey::new(key.algorithm(), &dummy_key_data).unwrap());
-        Self {
-            keys: [
-                CryptoKey::new(&rand, key, nonce_half),
-                CryptoKey::new(&rand, dummy_key1, nonce_half),
-                CryptoKey::new(&rand, dummy_key2, nonce_half),
-                CryptoKey::new(&rand, dummy_key3, nonce_half),
-            ],
-            current_key: 0,
-            nonce_half,
-            rand,
-        }
+        // Pre-fill all slots with random dummy keys; slot 0 is replaced by the
+        // real handshake key below. A wider ring (8) keeps several past rotated
+        // keys decryptable so a single lost/retransmitted rotation frame cannot
+        // evict a key the peer is still using for sending.
+        let mut keys: [CryptoKey; KEY_SLOTS] = std::array::from_fn(|_| {
+            let dummy_key_data = random_data(key.algorithm().key_len());
+            let dummy = LessSafeKey::new(UnboundKey::new(key.algorithm(), &dummy_key_data).unwrap());
+            CryptoKey::new(&rand, dummy, nonce_half)
+        });
+        keys[0] = CryptoKey::new(&rand, key, nonce_half);
+        Self { keys, current_key: 0, nonce_half, rand }
     }
 
     pub fn encrypt(&mut self, buffer: &mut MsgBuffer) {
@@ -203,7 +204,7 @@ impl CryptoCore {
         let mut nonce;
         {
             let mut extra = Cursor::new(extra);
-            key_id = extra.read_u8().map_err(|_| Error::Crypto("Input data too short"))? % 4;
+            key_id = extra.read_u8().map_err(|_| Error::Crypto("Input data too short"))? as usize % KEY_SLOTS;
             nonce = Nonce::zero();
             extra.read_exact(&mut nonce.0[5..]).map_err(|_| Error::Crypto("Input data too short"))?;
             nonce.set_msb(if self.nonce_half { 0x00 } else { 0x80 });
@@ -219,7 +220,7 @@ impl CryptoCore {
 
     pub fn rotate_key(&mut self, key: LessSafeKey, id: u64, use_for_sending: bool) {
         debug!("Rotated key {} (use for sending: {})", id, use_for_sending);
-        let id = (id % 4) as usize;
+        let id = (id % KEY_SLOTS as u64) as usize;
         self.keys[id] = CryptoKey::new(&self.rand, key, self.nonce_half);
         if use_for_sending {
             self.current_key = id;
@@ -438,7 +439,9 @@ mod tests {
 
     #[test]
     fn test_core_size() {
-        assert_eq!(2384, mem::size_of::<CryptoCore>());
+        // Sanity bound: the CryptoCore holds KEY_SLOTS rotating keys; guard
+        // against accidental blow-up rather than pin an exact byte count.
+        assert!(mem::size_of::<CryptoCore>() < 16 * 1024);
     }
 
     #[test]

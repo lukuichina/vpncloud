@@ -464,6 +464,18 @@ pub fn run_cmd(mut cmd: Command) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static MACHINE_ID_OVERRIDE: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+}
+
+/// Test-only: override the machine id returned by get_machine_id() on this
+/// thread, so each simulated node can have a distinct, stable node_id.
+#[cfg(test)]
+pub fn set_machine_id_override(id: Option<String>) {
+    MACHINE_ID_OVERRIDE.with(|m| *m.borrow_mut() = id);
+}
+
 /// Get a stable machine identifier for node_id derivation.
 /// Uses platform-specific sources in priority order:
 /// - Linux: /etc/machine-id, /var/lib/dbus/machine-id
@@ -471,6 +483,16 @@ pub fn run_cmd(mut cmd: Command) {
 /// - macOS: IOPlatformUUID
 /// - Fallback: hostname + first non-loopback MAC address
 pub fn get_machine_id() -> String {
+    // Test-only override: the mock simulator runs every node on one host, which
+    // would otherwise give them all the same machine_id (and thus the same
+    // node_id in password mode), collapsing distinct peers. Tests set a unique
+    // id per simulated node via set_machine_id_override().
+    #[cfg(test)]
+    {
+        if let Some(id) = MACHINE_ID_OVERRIDE.with(|m| m.borrow().clone()) {
+            return id;
+        }
+    }
     // Linux: machine-id files
     #[cfg(target_os = "linux")]
     {

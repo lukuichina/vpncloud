@@ -252,6 +252,9 @@ impl TunTapDevice {
                 get_device_mtu(&default_device)? - self.get_overhead()
             }
         };
+        // Clamp to a safe minimum: 68 is the minimum IPv4 MTU (RFC 791).
+        // 1280 is the minimum IPv6 MTU (RFC 8200). Use the larger of the two.
+        let value = value.max(68);
         info!("Setting MTU {} on device {}", value, self.ifname);
         set_device_mtu(&self.ifname, value)
     }
@@ -741,7 +744,60 @@ mod windows_device {
             Ok(Self { ifname, type_, session, ip: None, read_wait_event })
         }
 
-        pub fn set_mtu(&self, _value: Option<usize>) -> io::Result<()> { Ok(()) }
+        pub fn set_mtu(&self, value: Option<usize>) -> io::Result<()> {
+        // Wintun adapter MTU is set via netsh. On Windows, a fixed MTU (e.g. 1380)
+        // is recommended to avoid IP fragmentation when traffic passes through
+        // WebSocket + cloudflared (HTTP/2 / QUIC), which adds significant overhead
+        // beyond the crypto/UDP envelope already accounted for in get_overhead().
+        let mtu = match value {
+            Some(v) => v,
+            None => {
+                // Default: 1380 — leaves room for IPv6 (40) + UDP (8) + crypto (32) +
+                // WebSocket framing + cloudflared HTTP/2 overhead within the
+                // typical 1500-byte physical MTU without triggering fragmentation.
+                1380
+            }
+        };
+        let mtu = mtu.max(68);
+        info!("Windows Wintun: setting MTU {} on adapter {}", mtu, self.ifname);
+        let mut cmd = std::process::Command::new("netsh");
+        cmd.args([
+            "interface", "ipv4", "set", "interface",
+            &format!("name={}", self.ifname),
+            "mtu", &mtu.to_string(),
+            "admin=enabled",
+        ]);
+        match run_command_with_timeout(cmd, Duration::from_secs(8), "netsh mtu") {
+            Ok(out) => {
+                info!(
+                    "Windows netsh MTU status={:?} stdout='{}' stderr='{}'",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Err(e) => warn!("Windows netsh MTU set failed: {}", e),
+        }
+        // Also try the IPv6 variant
+        let mut cmd6 = std::process::Command::new("netsh");
+        cmd6.args([
+            "interface", "ipv6", "set", "interface",
+            &format!("name={}", self.ifname),
+            "mtu", &mtu.to_string(),
+        ]);
+        match run_command_with_timeout(cmd6, Duration::from_secs(8), "netsh mtu ipv6") {
+            Ok(out) => {
+                info!(
+                    "Windows netsh IPv6 MTU status={:?} stdout='{}' stderr='{}'",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Err(e) => warn!("Windows netsh IPv6 MTU set failed: {}", e),
+        }
+        Ok(())
+    }
         pub fn configure(&mut self, addr: IpAddr, netmask: IpAddr) -> io::Result<()> {
             // Best-effort: configure via netsh; store IP for get_ip
             info!("Windows device configure start: ifname={} addr={} netmask={}", self.ifname, addr, netmask);
@@ -912,7 +968,13 @@ mod windows_device {
         }
         pub fn get_rp_filter(&self) -> io::Result<u8> { Ok(1) }
         pub fn fix_rp_filter(&self) -> io::Result<()> { Ok(()) }
-        pub fn get_overhead(&self) -> usize { 40 + 8 + 16 + 16 + 1 }
+        pub fn get_overhead(&self) -> usize {
+            // Wintun overhead: IPv6 (40) + UDP (8) + crypto EXTRA_LEN (16) + TAG_LEN (16) +
+            // message type (1) + WebSocket framing + cloudflared HTTP/2 overhead.
+            // The extra 120 bytes accounts for WebSocket frame headers, HTTP/2 frame
+            // headers, and QUIC/HTTP3 overhead when tunneled through cloudflared.
+            40 + 8 + 16 + 16 + 1 + 120
+        }
     }
 
     impl Device for WintunDevice {
@@ -932,21 +994,8 @@ mod windows_device {
                 Ok(Some(packet)) => {
                     let bytes = packet.bytes();
                     let len = bytes.len();
-                    // HOT PATH FILTER: drop IPv6 link-local multicast (ff02::) noise.
-                    // Windows constantly generates IPv6 multicast/SSDP/LLMNR packets on the
-                    // TUN interface. If we let them through, the device stays readable forever
-                    // and starves the socket in the single-threaded event loop.
-                    if len >= 26 && bytes[0] >> 4 == 6 && bytes[24] == 0xff && bytes[25] == 0x02 {
-                        let ok = READ_OK.fetch_add(1, Ordering::Relaxed) + 1;
-                        let us = t0.elapsed().as_micros();
-                        if ok % 100 == 1 {
-                            debug!(
-                                "[TUN_READ] dropped IPv6 multicast packet_len={} read_us={} ok={}",
-                                len, us, ok
-                            );
-                        }
-                        return Err(Error::Device("empty".to_string()));
-                    }
+                    // NOTE: IPv6 multicast filtering is now done in handle_interface_data() in cloud.rs
+                    // to avoid premature "empty" returns that stop the drain loop.
                     buffer.set_length(len);
                     buffer.message_mut().copy_from_slice(bytes);
                     let ok = READ_OK.fetch_add(1, Ordering::Relaxed) + 1;
@@ -968,7 +1017,8 @@ mod windows_device {
                     let none = READ_NONE.fetch_add(1, Ordering::Relaxed) + 1;
                     let streak = NONE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
                     let us = t0.elapsed().as_micros();
-                    if none <= 20 || none % 200 == 0 || streak <= 5 || streak % 100 == 0 {
+                    // Reduced logging: sample every 1000 empty reads, or when streak indicates potential issue
+                    if none % 1000 == 0 || streak <= 5 || streak % 500 == 0 {
                         debug!(
                             "[TUN_READ] result=None(empty) read_us={} ok={} none={} err={} none_streak={} waited_ms=0",
                             us,

@@ -18,7 +18,7 @@ pub use crate::{
     device::{MockDevice, Type},
     net::MockSocket,
     payload::{Frame, Packet, Protocol},
-    util::{MockTimeSource, Time, TimeSource},
+    util::{MockTimeSource, Time, TimeSource, set_machine_id_override},
 };
 
 static INIT_LOGGER: Once = Once::new();
@@ -88,7 +88,12 @@ impl<P: Protocol> Simulator<P> {
         }
         DebugLogger::set_node(self.next_port as usize);
         self.next_port += 1;
+        // Give each simulated node a distinct machine id so password-mode
+        // node_ids are unique (real deployments are separate machines).
+        let sim_machine = format!("sim-machine-{}", addr);
+        set_machine_id_override(Some(sim_machine));
         let node = TestNode::new(&config, MockSocket::new(addr), MockDevice::new(), None, None);
+        set_machine_id_override(None);
         DebugLogger::set_node(0);
         self.nodes.insert(addr, node);
         addr

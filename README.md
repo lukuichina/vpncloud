@@ -61,6 +61,15 @@ $> vpncloud --ws-proxy :8080 --password mysecret --ip 10.0.0.1/24
 # UDP listens on 0.0.0.0:8080, WS proxy listens on 0.0.0.0:8080
 ```
 
+### WebSocket Reconnection
+
+When running in WebSocket proxy mode (`--ws-proxy`), vpnCloud automatically
+reconnects if the WebSocket connection is lost (network blip, proxy restart,
+etc.). The underlying TCP/WebSocket connection is re-established and the peer
+connection is re-initiated via the standard handshake — no manual restart
+required. Reconnection uses a 5-second retry interval to avoid hammering a
+downstream proxy.
+
 ### `--sni` (custom TLS SNI / HTTP Host header for wss://)
 
 When connecting to a `wss://` URL whose target is an IP address, the TLS SNI
@@ -147,6 +156,39 @@ $> vpncloud --ip 10.0.0.1/24 -p mysecret --peer REMOTE_HOST:PORT
 ```
 
 For dual-stack operation (both IPv4 and IPv6 on the same TUN device), configure the second address via the `--ifup` script or config file, since `--ip` accepts a single address.
+
+**Dual-stack with `--ip` and `--ipv6`:**
+When both `--ip` and `--ipv6` are given, vpnCloud configures both an IPv4 and an IPv6 address on the TUN device. Both addresses are auto-claimed (`/32` for IPv4, `/128` for IPv6) so direct peer communication works without additional `--claim`:
+
+```sh
+$> vpncloud --ip 10.0.0.1/24 --ipv6 fd03::3 -p mysecret --peer REMOTE_HOST:PORT
+```
+
+The `--advertise-addresses` option can be used to publish additional addresses to peers (e.g. for multi-homed nodes):
+
+```sh
+$> vpncloud --ip 10.0.0.1/24 --ipv6 fd03::3 --advertise-addresses 10.0.0.1,fd03::3 -p mysecret
+```
+
+**Automatic address discovery with `--advertise_auto` (default: off):**
+Instead of listing addresses manually, `--advertise_auto` makes vpnCloud enumerate the
+unicast IPv4/IPv6 addresses of all local *active* network cards and advertise them:
+
+```sh
+$> vpncloud --ip 10.0.0.1/24 --ipv6 fd03::3 --advertise_auto -p mysecret --peer REMOTE_HOST:PORT
+```
+
+The enumeration deliberately skips:
+- loopback (`127.0.0.0/8`, `::1`), unspecified (`0.0.0.0`, `::`) and link-local
+  (`169.254.0.0/16`, `fe80::/10`) addresses, which are not routable to peers;
+- the vpnCloud virtual interface itself (`vpncloud0`), so the tunnel addresses
+  (e.g. `10.0.0.1`, `fd03::3`) are never advertised back to peers (no self-loop).
+
+This is useful on multi-homed nodes (LAN + a mesh/VPN interface + public IPv6):
+peers learn every reachable address without hand-maintaining `--advertise-addresses`.
+It is disabled by default; the previous behaviour (`--advertise-addresses` or the
+kernel route lookup toward each peer) is unchanged.
+
 
 ### Authentication: `--password` vs `--private-key`/`--public-key`
 
@@ -271,6 +313,47 @@ but add latency. Default: `50` ms.
 ```sh
 $> vpncloud --poll-timeout-ms 5 --ip 10.0.0.1/24 -p mysecret
 ```
+
+## `--mtu` (TUN/TAP interface MTU)
+
+Sets the MTU for the virtual TUN/TAP interface. When omitted, the MTU is derived
+automatically from the default route MTU minus crypto/encapsulation overhead.
+
+On **Windows**, a fixed MTU of `1380` is used by default. This accounts for the
+additional overhead introduced by WebSocket framing and cloudflared (HTTP/2 /
+QUIC) encapsulation, which can push the outer packet size beyond the physical
+NIC MTU (typically 1500) and trigger IP fragmentation. Fragmentation in turn
+causes packet loss and increased latency.
+
+```sh
+# Explicit MTU (recommended for Windows + cloudflared)
+$> vpncloud --mtu 1380 --ip 10.0.0.1/24 -p mysecret
+
+# Auto-derive from default route (Linux default)
+$> vpncloud --ip 10.0.0.1/24 -p mysecret
+```
+
+## `--advertise_auto` (automatic local address discovery)
+
+When enabled (`false` by default), vpnCloud actively enumerates the unicast
+IPv4/IPv6 addresses of every **active** local network card and advertises them to
+peers — no need to maintain `--advertise-addresses` by hand on multi-homed hosts
+(LAN + a mesh/VPN interface + public IPv6).
+
+```sh
+$> vpncloud --ip 10.0.0.1/24 --ipv6 fd03::3 --advertise_auto -p mysecret --peer REMOTE_HOST:PORT
+```
+
+Filtered out automatically (never advertised):
+
+- loopback (`127.0.0.0/8`, `::1`) and unspecified (`0.0.0.0`, `::`) addresses;
+- link-local addresses (`169.254.0.0/16`, `fe80::/10`), not routable to peers;
+- interfaces that are down (`is_up() == false`);
+- **the vpnCloud virtual interface itself (`vpncloud0`)** — the tunnel addresses
+  (e.g. `10.0.0.1`, `fd03::3`) are never advertised back to peers (no self-loop).
+
+When the flag is off, behaviour is unchanged (explicit `--advertise-addresses`
+or the kernel route lookup toward each peer).
 
 ## `--allow-snat` (SNAT/NAT address change handling)
 

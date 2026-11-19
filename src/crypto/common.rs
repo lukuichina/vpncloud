@@ -35,7 +35,15 @@ const SPEED_TEST_TIME: f32 = 0.02;
 #[cfg(not(test))]
 const SPEED_TEST_TIME: f32 = 0.1;
 
-const ROTATE_INTERVAL: usize = 120;
+// Periodic key rotation interval, in ticks (ticks == seconds here, since
+// every_second() is driven once per housekeep). Rotation was previously
+// disabled (usize::MAX) because a lost/reordered rotation frame could desync
+// the peers' key slots and cause "Failed to decrypt". Two changes make it
+// safe again: (1) the NodeId-primary refactor no longer rebuilds peer.crypto
+// on address change, so rotation state survives roaming; (2) the CryptoCore
+// key ring was widened 4->8 slots so an in-flight key cannot be evicted by a
+// single lost/retransmitted rotation within its recovery window.
+// The rotation period is set at runtime via --rotate-interval (0 = disabled).
 
 pub trait Payload: Debug + PartialEq + Sized {
     fn write_to(&self, buffer: &mut MsgBuffer);
@@ -65,6 +73,10 @@ pub struct Config {
     pub public_key: Option<String>,
     pub trusted_keys: Vec<String>,
     pub algorithms: Vec<String>,
+    /// Periodic key rotation interval in seconds (0 = disabled). Driven once
+    /// per second from the housekeep loop. Configurable at runtime via
+    /// `--rotate-interval` so rotation can be toggled without recompiling.
+    pub rotate_interval: usize,
 }
 
 pub struct Crypto {
@@ -72,6 +84,7 @@ pub struct Crypto {
     key_pair: Arc<Ed25519KeyPair>,
     trusted_keys: Arc<[Ed25519PublicKey]>,
     algorithms: Algorithms,
+    rotate_interval: usize,
 }
 
 impl Crypto {
@@ -145,11 +158,13 @@ impl Crypto {
                 speeds.into_iter().map(|(a, s)| format!("{}: {:.1} MiB/s", a, s)).collect::<Vec<_>>().join(", ")
             );
         }
+        info!("Key rotation interval: {}s (0 = disabled)", config.rotate_interval);
         Ok(Self {
             node_id,
             key_pair: Arc::new(key_pair),
             trusted_keys: trusted_keys.into_boxed_slice().into(),
             algorithms: algos,
+            rotate_interval: config.rotate_interval,
         })
     }
 
@@ -242,6 +257,7 @@ impl Crypto {
             self.key_pair.clone(),
             self.trusted_keys.clone(),
             self.algorithms.clone(),
+            self.rotate_interval,
         )
     }
 }
@@ -263,12 +279,18 @@ pub struct PeerCrypto<P: Payload> {
     unencrypted: bool,
     core: Option<CryptoCore>,
     rotate_counter: usize,
+    /// Rotation period in ticks (~seconds); 0 disables rotation.
+    rotate_interval: usize,
+    /// Role we played in the completed handshake: Some(true) if we were the
+    /// initiator (we sent PING), Some(false) if responder. Used for
+    /// deterministic simultaneous-open tie-breaking. None until init succeeds.
+    initiator: Option<bool>,
 }
 
 impl<P: Payload> PeerCrypto<P> {
     pub fn new(
         node_id: NodeId, init_payload: P, key_pair: Arc<Ed25519KeyPair>, trusted_keys: Arc<[Ed25519PublicKey]>,
-        algorithms: Algorithms,
+        algorithms: Algorithms, rotate_interval: usize,
     ) -> Self {
         Self {
             node_id,
@@ -277,6 +299,8 @@ impl<P: Payload> PeerCrypto<P> {
             unencrypted: false,
             core: None,
             rotate_counter: 0,
+            rotate_interval,
+            initiator: None,
         }
     }
 
@@ -323,6 +347,12 @@ impl<P: Payload> PeerCrypto<P> {
         self.core.is_some()
     }
 
+    /// Role in the completed handshake: Some(true) = we were initiator,
+    /// Some(false) = we were responder, None = not negotiated yet.
+    pub fn is_initiator(&self) -> Option<bool> {
+        self.initiator
+    }
+
     pub fn algorithm_name(&self) -> &'static str {
         if let Some(ref core) = self.core {
             let algo = core.algorithm();
@@ -349,6 +379,7 @@ impl<P: Payload> PeerCrypto<P> {
             InitResult::Continue => Ok(MessageResult::Reply),
             InitResult::Success { peer_payload, is_initiator } => {
                 let unencrypted_planned = self.get_init()?.selected_algorithm().is_none();
+                self.initiator = Some(is_initiator);
                 debug!(
                     "Crypto init success: is_initiator={}, unencrypted_planned={}",
                     is_initiator, unencrypted_planned
@@ -465,8 +496,12 @@ impl<P: Payload> PeerCrypto<P> {
             return Ok(MessageResult::Reply);
         }
         if let Some(ref mut rotate) = self.rotation {
+            // rotate_interval == 0 disables periodic rekeying (configurable via --rotate-interval).
+            if self.rotate_interval == 0 {
+                return Ok(MessageResult::None);
+            }
             self.rotate_counter += 1;
-            if self.rotate_counter >= ROTATE_INTERVAL {
+            if self.rotate_counter >= self.rotate_interval {
                 self.rotate_counter = 0;
                 if let Some(rot) = rotate.cycle(out) {
                     let core = self.get_core()?;

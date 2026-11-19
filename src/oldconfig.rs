@@ -98,6 +98,7 @@ impl OldConfigFile {
                 private_key: None,
                 public_key: None,
                 trusted_keys: vec![],
+                rotate_interval: 0,
             },
             device: Some(ConfigFileDevice {
                 fix_rp_filter: None,

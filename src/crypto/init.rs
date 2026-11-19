@@ -588,19 +588,35 @@ impl<P: Payload> InitState<P> {
             return Err(Error::CryptoInitFatal("Connected to self"));
         }
         if stage != self.next_stage {
-            if self.next_stage == STAGE_PONG && stage == STAGE_PING {
-                // special case for concurrent init messages in both directions
-                // the node with the higher node_id "wins" and gets to initialize the connection
-                if salted_node_id_hash > self.salted_node_id_hash {
-                    debug!("Init stage mismatch (expected PONG, got PING): remote wins tie-break, resetting to STAGE_PING");
-                    // reset to initial state
-                    self.next_stage = STAGE_PING;
-                    self.last_message = None;
-                    self.ecdh_private_key = None;
+            if self.next_stage == WAITING_TO_CLOSE {
+                // Handshake already completed (post-success grace window). A stray /
+                // duplicate / competing init stage must NOT be allowed to reset a
+                // live, successfully negotiated handshake (old half-open state reuse).
+                debug!(
+                    "Init stage mismatch: handshake already complete (WAITING_TO_CLOSE), ignoring stage={}",
+                    stage
+                );
+                return Ok(InitResult::Continue);
+            } else if self.next_stage == STAGE_PONG && stage == STAGE_PING {
+                // Simultaneous open: both sides sent PING. The tie-break MUST be
+                // symmetric so both ends converge on the same role split. The full
+                // salted_node_id_hash contains each side's random salt and derived
+                // digest, so comparing it is asymmetric (each side can think it
+                // "wins"). Compare only the 4-byte random salt prefix instead: both
+                // peers can see the other's salt in the message, and the salts are
+                // (with overwhelming probability) distinct, so exactly one side is
+                // greater -> deterministic, consistent winner.
+                //   * higher salt => INITIATOR: keep/retransmit our PING, ignore peer PING.
+                //   * lower  salt => RESPONDER: fall through and reply PONG to peer PING.
+                let self_salt = &self.salted_node_id_hash[0..4];
+                let peer_salt = &salted_node_id_hash[0..4];
+                if self_salt > peer_salt {
+                    debug!("Init simultaneous-open: local salt higher, staying initiator, ignoring peer PING");
+                    // Retransmissions driven by every_second(); just wait for peer PONG.
+                    return Ok(InitResult::Continue);
                 } else {
-                    debug!("Init stage mismatch (expected PONG, got PING): local wins tie-break, handling as responder");
-                    // Don't ignore — fall through to handle the PING normally,
-                    // effectively switching local to responder role.
+                    debug!("Init simultaneous-open: peer salt higher, switching to responder for peer PING");
+                    // Fall through to handle the PING as responder (send PONG).
                 }
             } else if self.next_stage == STAGE_PONG && stage == STAGE_PENG {
                 // Peer completed handshake as initiator and already sent PENG.
