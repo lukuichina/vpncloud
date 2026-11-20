@@ -173,6 +173,189 @@ fn parse_ip_netmask(addr: &str) -> Result<(std::net::IpAddr, std::net::IpAddr), 
     }
 }
 
+/// Add or delete a route that steers a claimed prefix into the tunnel device.
+/// Uses the platform-native tool so claim routes work on both platforms:
+///   - Unix:    `ip route add|del <net>/<prefix> dev <ifname>` (v4 or v6)
+///   - Windows: `netsh interface ipv4|ipv6 add|delete route prefix=<net>/<prefix>
+///               interface=<ifname> store=active`
+fn ip_route(ifname: &str, addr: std::net::IpAddr, prefix: u8, add: bool) -> Result<(), String> {
+    try_ip_route(ifname, addr, prefix, add).map_err(|e| {
+        format!(
+            "failed to {} route {}/{} via dev {}: {}",
+            if add { "add" } else { "delete" },
+            addr,
+            prefix,
+            ifname,
+            e
+        )
+    })
+}
+
+fn try_ip_route(ifname: &str, addr: std::net::IpAddr, prefix: u8, add: bool) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let op = if add { "add" } else { "del" };
+        let out = process::Command::new("ip")
+            .args(["route", op, &format!("{}/{}", addr, prefix), "dev", ifname])
+            .output()
+            .map_err(|e| format!("failed to run `ip route {}`: {}", op, e))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "`ip route {}` status={:?} stderr='{}'",
+                op,
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+    #[cfg(windows)]
+    {
+        let family = match addr {
+            std::net::IpAddr::V4(_) => "ipv4",
+            std::net::IpAddr::V6(_) => "ipv6",
+        };
+        let route = format!("prefix={}/{}", addr, prefix);
+        let iface = format!("interface={}", ifname);
+        let out = if add {
+            process::Command::new("netsh")
+                .args(["interface", family, "add", "route", &route, &iface, "store=active"])
+                .output()
+        } else {
+            process::Command::new("netsh")
+                .args(["interface", family, "delete", "route", &route, &iface, "store=active"])
+                .output()
+        }
+        .map_err(|e| format!("failed to run `netsh interface {} route`: {}", family, e))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "`netsh interface {} {} route` status={:?} stdout='{}' stderr='{}'",
+                family,
+                if add { "add" } else { "delete" },
+                out.status,
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+}
+
+/// Windows: add a secondary IPv6 address **with its prefix length** and verify
+/// that the address really landed on the interface (netsh silently accepts
+/// `address=<ip>` without a prefix and then uses a default prefix, so we must
+/// both pass and verify the prefix).
+#[cfg(windows)]
+fn windows_add_ipv6_address(ifname: &str, ip_str: &str, prefix: u8) -> Result<(), String> {
+    let out = process::Command::new("netsh")
+        .args([
+            "interface",
+            "ipv6",
+            "add",
+            "address",
+            &format!("interface={}", ifname),
+            &format!("address={}/{}", ip_str, prefix),
+            "type=unicast",
+            "store=active",
+        ])
+        .output()
+        .map_err(|e| format!("failed to run netsh add address: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "netsh add address status={:?} stdout='{}' stderr='{}'",
+            out.status,
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // Read back the actual address list to confirm address and prefix length.
+    let show = process::Command::new("netsh")
+        .args(["interface", "ipv6", "show", "addresses", &format!("interface={}", ifname)])
+        .output()
+        .map_err(|e| format!("failed to run netsh show addresses: {}", e))?;
+    let text = String::from_utf8_lossy(&show.stdout).to_string();
+    let lower = text.to_lowercase();
+    if !lower.contains(&ip_str.to_lowercase()) {
+        return Err(format!("address {} not present after add; netsh output:\n{}", ip_str, text));
+    }
+    if !text.contains(&format!("/{}", prefix)) {
+        warn!(
+            "Windows IPv6 address {} is present but prefix /{} was not confirmed; netsh output:\n{}",
+            ip_str, prefix, text
+        );
+    } else {
+        debug!("Windows IPv6 address {} confirmed with prefix /{}: {}", ip_str, prefix, text.trim());
+    }
+    Ok(())
+}
+
+/// Windows: delete a secondary IPv6 address (address/prefix form).
+#[cfg(windows)]
+fn windows_del_ipv6_address(ifname: &str, ip_str: &str, prefix: u8) -> Result<(), String> {
+    let out = process::Command::new("netsh")
+        .args([
+            "interface",
+            "ipv6",
+            "delete",
+            "address",
+            &format!("interface={}", ifname),
+            &format!("address={}/{}", ip_str, prefix),
+            "store=active",
+        ])
+        .output()
+        .map_err(|e| format!("failed to run netsh delete address: {}", e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "netsh delete address status={:?} stdout='{}' stderr='{}'",
+            out.status,
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Remove claim routes / secondary addresses installed at startup, so the host
+/// does not keep stale routes pointing at a dead tunnel interface.
+fn cleanup_tunnel_config(config: &Config, ifname: &str) {
+    for claim_str in &config.claims {
+        if let Ok(claim) = crate::types::Range::from_str(claim_str) {
+            let addr = match claim.base {
+                Address { data, len: 4 } => std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    data[0], data[1], data[2], data[3],
+                )),
+                Address { data, len: 16 } => std::net::IpAddr::V6(std::net::Ipv6Addr::from(data)),
+                _ => continue,
+            };
+            if claim.prefix_len > 0 && (claim.prefix_len as u16) <= (if addr.is_ipv4() { 32 } else { 128 }) {
+                match ip_route(ifname, addr, claim.prefix_len, false) {
+                    Ok(()) => debug!("Removed route {}/{} via dev {}", addr, claim.prefix_len, ifname),
+                    Err(e) => debug!("Could not remove route {}/{}: {}", addr, claim.prefix_len, e),
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Mirror setup_device(): the secondary address exists only when both
+        // --ip and --ipv6 are set and they differ.
+        if let (Some(ref ip), Some(ref ipv6_addr)) = (&config.ip, &config.ipv6) {
+            if ip != ipv6_addr {
+                if let Ok((IpAddr::V6(v6), netmask)) = parse_ip_netmask(ipv6_addr) {
+                    let prefix = match netmask {
+                        IpAddr::V6(mask) => mask.octets().iter().map(|b| b.count_ones() as u32).sum::<u32>(),
+                        _ => 64,
+                    };
+                    let _ = windows_del_ipv6_address(ifname, &v6.to_string(), prefix as u8);
+                }
+            }
+        }
+    }
+}
+
 fn setup_device(config: &Config) -> TunTapDevice {
     let mut device = try_fail!(
         TunTapDevice::new(&config.device_name, config.device_type, config.device_path.as_ref().map(|s| s as &str)),
@@ -200,34 +383,6 @@ fn setup_device(config: &Config) -> TunTapDevice {
         }
         configured_addrs.push(ip);
 
-        // Add IPv6 route for primary IPv6 claims (legacy behavior).
-        if let IpAddr::V6(_) = ip {
-            for claim_str in &config.claims {
-                if let Ok(claim) = crate::types::Range::from_str(claim_str) {
-                    if let Address { data, len: 16 } = claim.base {
-                        let ip6 = std::net::Ipv6Addr::from(data);
-                        let prefix = claim.prefix_len;
-                        if prefix > 0 && prefix <= 128 {
-                            let ifname = device.ifname();
-                            let status = std::process::Command::new("ip")
-                                .args(["route", "add", &format!("{}/{}", ip6, prefix), "dev", ifname])
-                                .status();
-                            match status {
-                                Ok(s) if s.success() => {
-                                    info!("Added IPv6 route {}/{} via dev {}", ip6, prefix, ifname);
-                                }
-                                Ok(s) => {
-                                    warn!("Failed to add IPv6 route {}/{} via dev {}: status {:?}", ip6, prefix, ifname, s);
-                                }
-                                Err(e) => {
-                                    warn!("Failed to add IPv6 route {}/{} via dev {}: {}", ip6, prefix, ifname, e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
     if let Some(ref ipv6_addr) = config.ipv6 {
         let already = config.ip.as_ref().map(|s| s == ipv6_addr).unwrap_or(false);
@@ -254,38 +409,44 @@ fn setup_device(config: &Config) -> TunTapDevice {
                 }
                 #[cfg(windows)]
                 {
-                    // Best-effort add secondary IPv6 on Windows Wintun adapter.
+                    // Add secondary IPv6 on Windows Wintun adapter. The prefix
+                    // length MUST be passed and then verified by reading back the
+                    // interface address list (netsh would otherwise default it).
                     let prefix = match netmask {
-                        IpAddr::V6(mask) => mask.octets().iter().map(|b| b.count_ones() as u32).sum::<u32>(),
-                        _ => 64,
+                        IpAddr::V6(mask) => mask.octets().iter().map(|b| b.count_ones() as u32).sum::<u32>() as u8,
+                        _ => 64u8,
                     };
-                    let ifname = device.ifname();
+                    let ifname = device.ifname().to_string();
                     let ip_str = match ip { IpAddr::V6(v)=>v.to_string(), _=>ip.to_string() };
-                    let output = std::process::Command::new("netsh")
-                        .args([
-                            "interface", "ipv6", "add", "address",
-                            &format!("interface={}", ifname),
-                            &format!("address={}", ip_str),
-                            "type=unicast",
-                            &format!("store=active"),
-                        ])
-                        .output();
-                    match output {
-                        Ok(o) if o.status.success() => {
-                            info!("Added IPv6 address {}/{} to Windows interface {}", ip_str, prefix, ifname);
-                        }
-                        Ok(o) => {
-                            warn!(
-                                "Failed to add IPv6 address {} to Windows interface {}: status={:?} stdout='{}' stderr='{}'",
-                                ip_str, ifname, o.status,
-                                String::from_utf8_lossy(&o.stdout).trim(),
-                                String::from_utf8_lossy(&o.stderr).trim()
-                            );
-                        }
-                        Err(e) => warn!("Failed to add IPv6 address {} to Windows interface {}: {}", ip_str, ifname, e),
+                    match windows_add_ipv6_address(&ifname, &ip_str, prefix) {
+                        Ok(()) => info!("Added IPv6 address {}/{} to Windows interface {}", ip_str, prefix, ifname),
+                        Err(e) => warn!("Failed to add IPv6 address {}/{} to Windows interface {}: {}", ip_str, prefix, ifname, e),
                     }
                 }
                 configured_addrs.push(ip);
+            }
+        }
+    }
+    // Install host routes for every claim (IPv4 and IPv6) so the OS actually
+    // sends traffic for the claimed prefix into the tunnel. This is independent
+    // of which family the primary address uses (previously only ran when the
+    // primary address was IPv6, which broke dual-stack claims).
+    for claim_str in &config.claims {
+        if let Ok(claim) = crate::types::Range::from_str(claim_str) {
+            let addr = match claim.base {
+                Address { data, len: 4 } => std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    data[0], data[1], data[2], data[3],
+                )),
+                Address { data, len: 16 } => std::net::IpAddr::V6(std::net::Ipv6Addr::from(data)),
+                _ => continue,
+            };
+            let max_prefix: u16 = if addr.is_ipv4() { 32 } else { 128 };
+            if claim.prefix_len > 0 && (claim.prefix_len as u16) <= max_prefix {
+                let ifname = device.ifname();
+                match ip_route(ifname, addr, claim.prefix_len, true) {
+                    Ok(()) => info!("Added route {}/{} via dev {}", addr, claim.prefix_len, ifname),
+                    Err(e) => warn!("{}", e),
+                }
             }
         }
     }
@@ -305,7 +466,7 @@ fn setup_device(config: &Config) -> TunTapDevice {
 }
 
 #[allow(clippy::cognitive_complexity)]
-fn run<P: Protocol>(config: Config, socket: UdpSocket) {
+fn run<P: Protocol>(mut config: Config, socket: UdpSocket) {
     info!("run: setup_device starting");
     let device = setup_device(&config);
     let device_ifname = device.ifname().to_string();
@@ -350,13 +511,13 @@ fn run<P: Protocol>(config: Config, socket: UdpSocket) {
     if config.daemonize {
         info!("Running process as daemon");
         let mut daemonize = daemonize::Daemonize::new();
-        if let Some(user) = config.user {
+        if let Some(user) = config.user.take() {
             daemonize = daemonize.user(&user as &str);
         }
-        if let Some(group) = config.group {
+        if let Some(group) = config.group.take() {
             daemonize = daemonize.group(&group as &str);
         }
-        if let Some(pid_file) = config.pid_file {
+        if let Some(pid_file) = config.pid_file.take() {
             daemonize = daemonize.pid_file(pid_file).chown_pid_file(true);
         }
         try_fail!(daemonize.start(), "Failed to daemonize: {}");
@@ -365,10 +526,10 @@ fn run<P: Protocol>(config: Config, socket: UdpSocket) {
         if config.user.is_some() || config.group.is_some() {
             info!("Dropping privileges");
             let mut pd = privdrop::PrivDrop::default();
-            if let Some(user) = config.user {
+            if let Some(user) = config.user.take() {
                 pd = pd.user(user);
             }
-            if let Some(group) = config.group {
+            if let Some(group) = config.group.take() {
                 pd = pd.group(group);
             }
             try_fail!(pd.apply(), "Failed to drop privileges: {}");
@@ -406,6 +567,9 @@ fn run<P: Protocol>(config: Config, socket: UdpSocket) {
         }
         info!("run: socket reconnected, resuming event loop");
     }
+    // Remove IPv6 claim routes / secondary addresses we installed so the host
+    // does not keep stale routes pointing at a dead tunnel interface.
+    cleanup_tunnel_config(&config, &device_ifname);
     if let Some(script) = config.ifdown {
         run_script(&script, &device_ifname);
     }

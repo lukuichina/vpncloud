@@ -308,10 +308,45 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 }
                 let dst = &payload[24..40];
                 // ff00::/8 (multicast)
-                if dst[0] == 0xff {
-                    return Some(true);
+                if dst[0] != 0xff {
+                    return Some(false);
                 }
-                Some(false)
+                // Do NOT drop every IPv6 multicast packet: NDP/MLD live on
+                // multicast and are required for IPv6 to work at all over the
+                // tunnel (Neighbor Solicitation/Advertisement, Router
+                // Solicitation/Advertisement, MLD reports). Only drop multicast
+                // traffic that is clearly unrelated (mDNS/SSDP/application
+                // multicast) — i.e. non-ICMPv6, non-DHCPv6 multicast.
+                let next_header = payload[6];
+                // Walk a simple hop-by-hop header chain so ICMPv6 behind an
+                // extension header is still recognised.
+                let mut nh = next_header;
+                let mut offset = 40usize;
+                let mut hops = 0;
+                while (nh == 0 || nh == 43 || nh == 60) && hops < 4 {
+                    if payload.len() < offset + 2 {
+                        break;
+                    }
+                    let hdr_len = (payload[offset + 1] as usize + 1) * 8;
+                    nh = payload[offset];
+                    offset += hdr_len;
+                    hops += 1;
+                }
+                if nh == 58 {
+                    // ICMPv6: keep (NDP: 133-137, MLD: 130/131/132/143,
+                    // router/neighbor discovery, duplicate address detection).
+                    return Some(false);
+                }
+                // DHCPv6 multicast groups (ff02::1:2 all-servers, ff05::1:3
+                // all-servers site scope): keep so clients can obtain addresses.
+                const DHCPV6_SERVERS: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x02];
+                const DHCPV6_SERVERS_SITE: [u8; 16] = [0xff, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x03];
+                if dst == DHCPV6_SERVERS || dst == DHCPV6_SERVERS_SITE {
+                    return Some(false);
+                }
+                // All-nodes / all-routers (ff02::1 / ff02::2) may still carry
+                // non-ICMPv6 payloads; drop only genuinely unrelated multicast.
+                Some(true)
             }
             _ => None,
         }
@@ -2711,5 +2746,73 @@ impl<P: Protocol> GenericCloud<MockDevice, P, MockSocket, MockTimeSource> {
 
     pub fn get_num(&self) -> usize {
         self.socket.address().unwrap().port() as usize
+    }
+}
+
+#[cfg(test)]
+mod mcast_filter_tests {
+    use super::{GenericCloud, MockDevice, MockSocket, MockTimeSource};
+
+    type Cloud = GenericCloud<MockDevice, crate::payload::Packet, MockSocket, MockTimeSource>;
+
+    fn ipv6_pkt(dst: [u8; 16], next_header: u8, icmp_type: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 48];
+        p[0] = 0x60;
+        p[6] = next_header;
+        p[24..40].copy_from_slice(&dst);
+        p[40] = icmp_type;
+        p
+    }
+
+    fn classify(p: &[u8]) -> Option<bool> {
+        Cloud::is_multicast_or_broadcast(p)
+    }
+
+    #[test]
+    fn ndp_neighbor_solicitation_is_kept() {
+        // Solicited-node multicast ff02::1:ff00:1, ICMPv6 type 135 (NS).
+        let dst = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0, 0, 0x01];
+        assert_eq!(classify(&ipv6_pkt(dst, 58, 135)), Some(false));
+    }
+
+    #[test]
+    fn ndp_router_advertisement_is_kept() {
+        // ff02::1 all-nodes, ICMPv6 type 134 (RA).
+        let dst = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        assert_eq!(classify(&ipv6_pkt(dst, 58, 134)), Some(false));
+    }
+
+    #[test]
+    fn mldv2_report_is_kept() {
+        // ff02::16, ICMPv6 type 143 (MLDv2 report).
+        let dst = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x16];
+        assert_eq!(classify(&ipv6_pkt(dst, 58, 143)), Some(false));
+    }
+
+    #[test]
+    fn dhcpv6_servers_multicast_is_kept() {
+        // ff02::1:2, UDP (17).
+        let dst = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x02];
+        assert_eq!(classify(&ipv6_pkt(dst, 17, 0)), Some(false));
+    }
+
+    #[test]
+    fn mdns_multicast_is_dropped() {
+        // ff02::fb (mDNS), UDP (17).
+        let dst = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb];
+        assert_eq!(classify(&ipv6_pkt(dst, 17, 0)), Some(true));
+    }
+
+    #[test]
+    fn ssdp_multicast_is_dropped() {
+        // ff02::c (SSDP), UDP (17).
+        let dst = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0c];
+        assert_eq!(classify(&ipv6_pkt(dst, 17, 0)), Some(true));
+    }
+
+    #[test]
+    fn plain_unicast_is_not_multicast() {
+        let dst = [0xfd, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        assert_eq!(classify(&ipv6_pkt(dst, 58, 128)), Some(false));
     }
 }
