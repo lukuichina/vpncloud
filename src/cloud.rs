@@ -48,6 +48,11 @@ pub type Hash = BuildHasherDefault<FnvHasher>;
 // than waiting up to an hour. Liveness resets the back-off immediately on any
 // received peer packet, so a modest cap costs nothing while connected.
 const MAX_RECONNECT_INTERVAL: u16 = 30;
+/// A pending (incomplete) handshake that makes no *authenticated progress* for
+/// this many seconds is considered stale and is discarded, so a peer that
+/// restarted (new ephemeral NodeId, new salt) can immediately establish a fresh
+/// handshake instead of being blocked by the old pending state.
+const PENDING_INIT_STALL: Time = 12;
 /// How long (seconds) an endpoint that proved unreachable is skipped before we
 /// are willing to dial it again. Prevents a gossip-learned direct peer whose
 /// addresses we cannot route from being re-dialed on every peer-list update.
@@ -103,6 +108,35 @@ struct PeerData {
     switch_after: Time,
 }
 
+/// A handshake that has not completed yet, with an independent lifetime.
+///
+/// `last_progress` is refreshed ONLY when an authenticated handshake message
+/// actually advances the state machine — periodic re-sends of the last message
+/// (every 1s in `crypto_housekeep`) do NOT count. If no progress happens for
+/// `PENDING_INIT_STALL` seconds the entry is dropped so a restarted peer can
+/// establish a brand-new handshake instead of colliding with stale state.
+pub struct PendingInit {
+    crypto: PeerCrypto<NodeInfo>,
+    /// When this pending handshake was created (diagnostics only).
+    created_at: Time,
+    /// Last time an authenticated message advanced the handshake.
+    last_progress: Time,
+    /// Last observed handshake stage (diagnostics only).
+    stage: u8,
+}
+
+impl PendingInit {
+    fn new(crypto: PeerCrypto<NodeInfo>, now: Time) -> Self {
+        let stage = crypto.stage();
+        PendingInit {
+            crypto,
+            created_at: now,
+            last_progress: now,
+            stage,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ReconnectEntry {
     address: Option<(String, Time)>,
@@ -133,7 +167,7 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     /// This node's own tunnel addresses (config ip/ipv6) — used to classify an
     /// incoming payload as "deliver locally" vs "userspace relay to another peer".
     local_addrs: SmallVec<[Address; 2]>,
-    pending_inits: HashMap<SocketAddr, PeerCrypto<NodeInfo>, Hash>,
+    pending_inits: HashMap<SocketAddr, PendingInit, Hash>,
     table: ClaimTable<TS>,
     socket: S,
     device: D,
@@ -837,7 +871,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         // entry that blocks further connect_sock() retries (the "already
         // pending, skipping" branch) until it times out.
         self.send_to(addr, &mut msg)?;
-        self.pending_inits.insert(addr, peer_crypto);
+        self.pending_inits.insert(addr, PendingInit::new(peer_crypto, TS::now()));
         Ok(())
     }
 
@@ -846,8 +880,29 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         let mut del_pending: SmallVec<[SocketAddr; 4]> = smallvec![];
         let mut del_peers: SmallVec<[NodeId; 4]> = smallvec![];
         for addr in self.pending_inits.keys().copied().collect::<SmallVec<[SocketAddr; 4]>>() {
+            let now = TS::now();
+            // Expire handshakes that made no authenticated progress for too long.
+            let (idle, age, stage) = {
+                let p = self.pending_inits.get(&addr).unwrap();
+                (
+                    now.saturating_sub(p.last_progress),
+                    now.saturating_sub(p.created_at),
+                    p.stage,
+                )
+            };
+            if idle >= PENDING_INIT_STALL {
+                info!(
+                    "Expiring pending handshake with {} after {}s without progress (age={}s stage={})",
+                    addr_nice(addr),
+                    idle,
+                    age,
+                    stage
+                );
+                del_pending.push(addr);
+                continue;
+            }
             msg.clear();
-            match self.pending_inits.get_mut(&addr).unwrap().every_second(&mut msg) {
+            match self.pending_inits.get_mut(&addr).unwrap().crypto.every_second(&mut msg) {
                 Err(_) => del_pending.push(addr),
                 Ok(MessageResult::None) => (),
                 Ok(MessageResult::Reply) => self.send_to(addr, &mut msg)?,
@@ -893,6 +948,21 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 entry.next = now + 1;
             }
         }
+    }
+
+    /// Record authenticated handshake progress for a pending init.
+    ///
+    /// Must only be called after `handle_message` returned `Ok`, so the 1s
+    /// re-send loop can never keep a dead handshake alive. Authenticated
+    /// handshake traffic also proves reachability, so it resets the reconnect
+    /// back-off (P2: unauth/undecryptable packets must NOT reset it).
+    fn note_pending_progress(&mut self, addr: SocketAddr) {
+        let now = TS::now();
+        if let Some(p) = self.pending_inits.get_mut(&addr) {
+            p.last_progress = now;
+            p.stage = p.crypto.stage();
+        }
+        self.reset_reconnect_backoff(addr);
     }
 
     /// Mark `addr` as temporarily unreachable so connect()/gossip-dial skips it.
@@ -1418,7 +1488,8 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 // clobber an existing ready handshake. When two handshakes race
                 // (both sides initiated), keep the canonical one so both sides
                 // converge on the same key instead of desyncing.
-                if let Some(init) = self.pending_inits.remove(&addr) {
+                if let Some(pending) = self.pending_inits.remove(&addr) {
+                    let init = pending.crypto;
                     if init.is_ready() {
                         let replace = if peer.crypto.is_ready() {
                             Self::prefer_new_handshake(&self_id, &node_id, peer.crypto.is_initiator(), init.is_initiator())
@@ -1454,7 +1525,8 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 crypto_replaced
             );
             self.update_peer_info(addr, Some(info))?;
-        } else if let Some(init) = self.pending_inits.remove(&addr) {
+        } else if let Some(pending) = self.pending_inits.remove(&addr) {
+            let init = pending.crypto;
             info!("Added peer node {} @ {}", bytes_to_hex(&node_id), addr_nice(endpoint));
             installed_new = true;
             self.config.call_hook(
@@ -1887,10 +1959,47 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             return Err(Error::Message("Packet too short"));
         }
 
-        let msg_result = if let Some(init) = self.pending_inits.get_mut(&src) {
+        let msg_result = if self.pending_inits.contains_key(&src) {
             // COLD PATH
             debug!("Dispatch: using pending init state for {}", addr_nice(src));
-            init.handle_message(data)
+            let res = self.pending_inits.get_mut(&src).unwrap().crypto.handle_message(data);
+            match res {
+                Ok(val) => {
+                    self.note_pending_progress(src);
+                    Ok(val)
+                }
+                Err(err) => {
+                    // A restarted peer sends a brand-new stage-1 (new salt) which the
+                    // old pending state cannot parse. Replace it ONLY if (a) the new
+                    // message authenticates (signature verified) and (b) the old
+                    // pending made no progress for >= PENDING_INIT_STALL. Otherwise
+                    // keep the salt-based simultaneous-open resolution untouched.
+                    if is_init_message(data.message()) {
+                        let mut candidate = self.crypto.peer_instance(self.create_node_info());
+                        if let Ok(val) = candidate.handle_message(data) {
+                            let stale = self
+                                .pending_inits
+                                .get(&src)
+                                .map(|p| TS::now().saturating_sub(p.last_progress) >= PENDING_INIT_STALL)
+                                .unwrap_or(true);
+                            if stale {
+                                info!(
+                                    "Replacing stale pending handshake with {} (new authenticated stage-1)",
+                                    addr_nice(src)
+                                );
+                                self.pending_inits.insert(src, PendingInit::new(candidate, TS::now()));
+                                self.note_pending_progress(src);
+                                return self.handle_message(src, val, data);
+                            }
+                            debug!(
+                                "Keeping in-progress pending handshake with {}; ignoring stage-1 from a competing handshake",
+                                addr_nice(src)
+                            );
+                        }
+                    }
+                    Err(err)
+                }
+            }
         } else if is_init_message(data.message()) {
             // COLD PATH
             debug!("Dispatch: init message from {}", addr_nice(src));
@@ -1947,7 +2056,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                             continue;
                         }
                         let mut test = data.clone();
-                        if init.handle_message(&mut test).is_ok() {
+                        if init.crypto.handle_message(&mut test).is_ok() {
                             matched_addr = Some(*addr);
                             break;
                         }
@@ -1966,10 +2075,16 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     }
                     effective_src = src;
                     // Process the message on the rebound init and send reply if needed
-                    if let Some(init) = self.pending_inits.get_mut(&src) {
-                        if let Ok(res) = init.handle_message(data) {
-                            self.handle_message(src, res, data)?;
-                        }
+                    let handled = if let Some(pending) = self.pending_inits.get_mut(&src) {
+                        pending.crypto.handle_message(data).ok()
+                    } else {
+                        None
+                    };
+                    if let Some(res) = handled {
+                        // Authenticated handshake progress: the address is reachable.
+                        self.note_pending_progress(src);
+                        self.reset_reconnect_backoff(src);
+                        self.handle_message(src, res, data)?;
                     }
                     return Ok(());
                 }
@@ -2008,6 +2123,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     }
                     self.addr_index.insert(src, pid);
                     effective_src = src;
+                    self.reset_reconnect_backoff(src);
                     self.handle_message(src, msg_result, &mut test)?;
                     return Ok(());
                 }
@@ -2037,7 +2153,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                             ],
                             true,
                         );
-                        self.pending_inits.insert(src, init);
+                        self.pending_inits.insert(src, PendingInit::new(init, TS::now()));
                         debug!("Dispatch: inserted pending init for {}", addr_nice(src));
                         Ok(res)
                     }
@@ -2100,6 +2216,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     peer.timeout = TS::now() + self.config.peer_timeout as Time;
                 }
                 self.addr_index.insert(src, pid);
+                self.reset_reconnect_backoff(src);
                 self.handle_message(src, msg_result, &mut decrypted_data)?;
                 Ok(MessageResult::None)
             } else {
@@ -2107,7 +2224,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 let mut matched_pending: Option<(SocketAddr, MessageResult<NodeInfo>, MsgBuffer)> = None;
                 for (addr, init) in self.pending_inits.iter_mut() {
                     let mut test = data.clone();
-                    if let Ok(msg_result) = init.handle_message(&mut test) {
+                    if let Ok(msg_result) = init.crypto.handle_message(&mut test) {
                         matched_pending = Some((*addr, msg_result, test));
                         break;
                     }
@@ -2123,6 +2240,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                             self.pending_inits.insert(src, init);
                         }
                     }
+                    self.reset_reconnect_backoff(src);
                     self.handle_message(src, msg_result, &mut decrypted_data)?;
                     Ok(MessageResult::None)
                 } else {
@@ -2141,13 +2259,13 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 }
             }
         };
-        // Any packet arriving from an address that belongs to a configured
-        // reconnect target proves reachability: reset its back-off immediately
-        // so a later drop retries from interval 1s instead of a long interval.
-        self.reset_reconnect_backoff(src);
         // HOT PATH
         match msg_result {
             Ok(val) => {
+                // Only authenticated traffic proves reachability: reset the
+                // back-off here, never for packets that fail to decrypt or
+                // authenticate (abnormal traffic must not pin retries at 1s).
+                self.reset_reconnect_backoff(src);
                 // HOT PATH
                 self.handle_message(effective_src, val, data)
             }

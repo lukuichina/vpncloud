@@ -347,6 +347,12 @@ impl<P: Payload> PeerCrypto<P> {
         self.core.is_some()
     }
 
+    /// Current handshake stage (only meaningful while `has_init()` is true).
+    /// Returns 0 once the handshake has completed.
+    pub fn stage(&self) -> u8 {
+        self.init.as_ref().map(|i| i.stage()).unwrap_or(0)
+    }
+
     /// Role in the completed handshake: Some(true) = we were initiator,
     /// Some(false) = we were responder, None = not negotiated yet.
     pub fn is_initiator(&self) -> Option<bool> {
