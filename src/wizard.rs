@@ -1,4 +1,9 @@
-use crate::{config::Config, crypto::Crypto, device, types::Mode};
+use crate::{
+    config::{Config, listen_modes_to_str, parse_listen_mode},
+    crypto::Crypto,
+    device,
+    types::Mode,
+};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
 use ring::aead;
 use std::{collections::HashMap, fs, io, path::Path};
@@ -28,8 +33,15 @@ fn str_opt(s: String) -> Option<String> {
 
 fn configure_connectivity(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> Result<(), dialoguer::Error> {
     if mode >= MODE_ADVANCED {
-        config.listen =
-            Input::with_theme(theme).with_prompt("Listen address").default(config.listen.clone()).interact_text()?;
+        let s: String = Input::with_theme(theme)
+            .with_prompt("Listen address (comma separated: ws://host:port, udp://host:port or IP:PORT)")
+            .default(listen_modes_to_str(&config.listen))
+            .interact_text()?;
+        config.listen = s
+            .split(',')
+            .map(|s| parse_listen_mode(s.trim()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Invalid listen address: {e}")))?;
     }
     config.peers = str_list(
         Input::with_theme(theme)

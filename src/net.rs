@@ -4,6 +4,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    hash::{Hash, Hasher},
     io::{self, ErrorKind},
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::atomic::{AtomicBool, Ordering},
@@ -22,6 +23,58 @@ use std::os::windows::io::IntoRawSocket;
 
 use super::util::{MockTimeSource, MsgBuffer, Time, TimeSource};
 use crate::{config::DEFAULT_PORT, port_forwarding::PortForwarding};
+
+/// 传输类型标识。同一个远端 IP:Port 可能同时通过 UDP 和 WebSocket 到达，
+/// TransportId 用于区分两条独立的通信路径，避免端点索引互相覆盖。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TransportId {
+    /// 第 N 个 UDP 监听/连接（u8 区分多个同类型传输实例）
+    Udp(u8),
+    /// 第 N 个 WebSocket 代理连接
+    WebSocket(u8),
+}
+
+impl Default for TransportId {
+    fn default() -> Self {
+        TransportId::Udp(0)
+    }
+}
+
+/// 完整的通信端点：网络地址 + 传输类型。Cloud 内部所有对等体索引、
+/// 收发路径均以 PeerEndpoint 为键，而非单一 SocketAddr。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PeerEndpoint {
+    pub addr: SocketAddr,
+    pub transport: TransportId,
+}
+
+impl PeerEndpoint {
+    pub fn udp(addr: SocketAddr, index: u8) -> Self {
+        Self { addr, transport: TransportId::Udp(index) }
+    }
+
+    pub fn websocket(addr: SocketAddr, index: u8) -> Self {
+        Self { addr, transport: TransportId::WebSocket(index) }
+    }
+
+    /// 兼容旧 API：只看地址部分，忽略传输。
+    pub fn socket_addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+impl std::fmt::Display for PeerEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}/{:?}", self.addr, self.transport)
+    }
+}
+
+/// 统一的网络入站包：携带完整端点，供 Cloud 按 transport 分发处理。
+#[derive(Clone, Debug)]
+pub struct NetPacket {
+    pub endpoint: PeerEndpoint,
+    pub data: Vec<u8>,
+}
 
 pub fn mapped_addr(addr: SocketAddr) -> SocketAddr {
     // HOT PATH
@@ -92,14 +145,42 @@ pub fn local_ip_for(dst: SocketAddr) -> Option<IpAddr> {
 #[cfg(unix)]
 pub trait Socket: AsRawFd + Sized {
     fn listen(addr: &str) -> Result<Self, io::Error>;
-    fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error>;
+    /// Receive one datagram, returning its complete endpoint (address + transport).
+    fn receive_endpoint(&mut self, buffer: &mut MsgBuffer) -> Result<PeerEndpoint, io::Error> {
+        let addr = self.receive(buffer)?;
+        Ok(PeerEndpoint { addr, transport: self.transport_id() })
+    }
+    fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error> {
+        match self.receive_endpoint(buffer) {
+            Ok(ep) => Ok(ep.addr),
+            Err(e) => Err(e),
+        }
+    }
+    /// 标识本 socket 所属的传输，供上层按 PeerEndpoint 分发出站数据。
+    /// 默认 Udp(0)，WebSocket 代理连接应覆盖为 WebSocket(idx)。
+    fn transport_id(&self) -> TransportId {
+        TransportId::Udp(0)
+    }
+
+    /// 优先返回 WebSocket 传输（若有），用于 connect_sock，避免混合模式下
+    /// init 消息错误地走 UDP 导致无法通过 WebSocket 隧道握手。
+    /// 默认实现等同于 transport_id()，ChannelSocket 会覆盖为优先 WebSocket。
+    fn preferred_transport_id(&self) -> TransportId {
+        self.transport_id()
+    }
+    /// Send to a complete endpoint; the transport selects the correct underlying
+    /// worker. Default implementation ignores the transport and uses `addr`.
+    fn send_endpoint(&mut self, data: &[u8], endpoint: PeerEndpoint) -> Result<usize, io::Error> {
+        let _ = endpoint;
+        self.send(data, endpoint.addr)
+    }
     fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error>;
     fn address(&self) -> Result<SocketAddr, io::Error>;
     fn create_port_forwarding(&self) -> Option<PortForwarding>;
     /// Returns the number of packets waiting in the receive channel (0 for non-channel sockets).
     fn pending(&self) -> usize { 0 }
     /// Channel-mode inbound receiver for low-latency blocking waits in main loop.
-    fn channel_net_rx(&self) -> Option<&crossbeam_channel::Receiver<crate::channel_io::NetPacket>> { None }
+    fn channel_net_rx(&self) -> Option<&crossbeam_channel::Receiver<crate::net::NetPacket>> { None }
     /// Re-establish the underlying connection after a disconnection.
     /// Used by WebSocket proxy clients to reconnect without restarting the process.
     /// Default implementation does nothing (no-op for plain UDP sockets).
@@ -132,14 +213,42 @@ pub trait Socket: AsRawFd + Sized {
 #[cfg(windows)]
 pub trait Socket: AsRawSocket + Sized {
     fn listen(addr: &str) -> Result<Self, io::Error>;
-    fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error>;
+    /// Receive one datagram, returning its complete endpoint (address + transport).
+    fn receive_endpoint(&mut self, buffer: &mut MsgBuffer) -> Result<PeerEndpoint, io::Error> {
+        let addr = self.receive(buffer)?;
+        Ok(PeerEndpoint { addr, transport: self.transport_id() })
+    }
+    fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error> {
+        match self.receive_endpoint(buffer) {
+            Ok(ep) => Ok(ep.addr),
+            Err(e) => Err(e),
+        }
+    }
+    /// 标识本 socket 所属的传输，供上层按 PeerEndpoint 分发出站数据。
+    /// 默认 Udp(0)，WebSocket 代理连接应覆盖为 WebSocket(idx)。
+    fn transport_id(&self) -> TransportId {
+        TransportId::Udp(0)
+    }
+
+    /// 优先返回 WebSocket 传输（若有），用于 connect_sock，避免混合模式下
+    /// init 消息错误地走 UDP 导致无法通过 WebSocket 隧道握手。
+    /// 默认实现等同于 transport_id()，ChannelSocket 会覆盖为优先 WebSocket。
+    fn preferred_transport_id(&self) -> TransportId {
+        self.transport_id()
+    }
+    /// Send to a complete endpoint; the transport selects the correct underlying
+    /// worker. Default implementation ignores the transport and uses `addr`.
+    fn send_endpoint(&mut self, data: &[u8], endpoint: PeerEndpoint) -> Result<usize, io::Error> {
+        let _ = endpoint;
+        self.send(data, endpoint.addr)
+    }
     fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error>;
     fn address(&self) -> Result<SocketAddr, io::Error>;
     fn create_port_forwarding(&self) -> Option<PortForwarding>;
     /// Returns the number of packets waiting in the receive channel (0 for non-channel sockets).
     fn pending(&self) -> usize { 0 }
     /// Channel-mode inbound receiver for low-latency blocking waits in main loop.
-    fn channel_net_rx(&self) -> Option<&crossbeam_channel::Receiver<crate::channel_io::NetPacket>> { None }
+    fn channel_net_rx(&self) -> Option<&crossbeam_channel::Receiver<crate::net::NetPacket>> { None }
     /// Re-establish the underlying connection after a disconnection.
     /// Used by WebSocket proxy clients to reconnect without restarting the process.
     /// Default implementation does nothing (no-op for plain UDP sockets).

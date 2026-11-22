@@ -61,14 +61,36 @@ $> vpncloud --ws-proxy :8080 --password mysecret --ip 10.0.0.1/24
 # UDP listens on 0.0.0.0:8080, WS proxy listens on 0.0.0.0:8080
 ```
 
+### `-l` / `--listen` address formats
+
+The listen option (`-l`, `--listen`) accepts several formats:
+
+* **Bare port number** — `-l 2600` binds to `[::]:2600` (dual-stack, IPv4+IPv6)
+* **`IP:PORT`** — `-l 0.0.0.0:2600` or `-l 192.168.1.1:2600`
+* **`[IPv6]:PORT`** — `-l [::]:2600` or `-l [fd03::1]:2600`
+* **`udp://IP:PORT`** — `-l udp://0.0.0.0:2600` (explicit UDP prefix, same as bare `IP:PORT`)
+* **`ws://` / `wss://`** — `-l wss://vc2.swings.one` (WebSocket proxy/tunnel listener)
+
+Multiple `-l` flags can be given to listen on several addresses simultaneously
+(e.g. `-l wss://vc2.swings.one -l 0.0.0.0:2600` for mixed WebSocket + UDP).
+
 ### WebSocket Reconnection
 
-When running in WebSocket proxy mode (`--ws-proxy`), vpnCloud automatically
-reconnects if the WebSocket connection is lost (network blip, proxy restart,
-etc.). The underlying TCP/WebSocket connection is re-established and the peer
-connection is re-initiated via the standard handshake — no manual restart
-required. Reconnection uses a 5-second retry interval to avoid hammering a
-downstream proxy.
+When running in WebSocket proxy mode (`--ws-proxy` or `-l wss://...`), vpnCloud
+automatically reconnects if the WebSocket connection is lost (network blip,
+proxy restart, etc.). The underlying TCP/WebSocket connection is re-established
+and the peer connection is re-initiated via the standard handshake — no manual
+restart required.
+
+Reconnection uses **exponential backoff** (starting at 2 seconds, doubling on
+each failure, capped at 30 seconds) to avoid hammering a downstream proxy.
+Each backoff step is interruptible (checked every 200 ms) so the process can
+shut down promptly even during a long backoff.
+
+When a WebSocket reconnect succeeds, any stale packets queued during the
+disconnect are drained and discarded, so half-encrypted frames from the broken
+connection are never injected into the new channel. Upper-layer VPN handshake
+retry naturally re-sends init packets over the new WebSocket stream.
 
 ### `--sni` (custom TLS SNI / HTTP Host header for wss://)
 

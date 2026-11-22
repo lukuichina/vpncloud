@@ -681,7 +681,17 @@ impl<P: Payload> InitState<P> {
                 let ecdh_private_key = match self.ecdh_private_key.take() {
                     Some(k) => k,
                     None => {
-                        debug!("Init processing PONG: no local ecdh private key, ignoring PONG");
+                        // Local ephemeral ECDH key was already consumed (e.g. by a
+                        // duplicate/retry PONG). Generate a fresh one so we can still
+                        // complete the simultaneous-open handshake instead of dropping
+                        // the PONG and stalling forever.
+                        debug!("Init processing PONG: no local ecdh private key, generating new ephemeral key");
+                        let (new_privk, new_pubk) = self.create_ecdh_keypair();
+                        // Send a fresh PING with the new public key so the peer can
+                        // re-derive the shared secret on its side.
+                        self.send_message(STAGE_PING, Some(new_pubk), out);
+                        self.next_stage = STAGE_PONG;
+                        self.ecdh_private_key = Some(new_privk);
                         return Ok(InitResult::Continue);
                     }
                 };

@@ -115,6 +115,7 @@ impl OldConfigFile {
             advertise_addresses: None,
             keepalive: self.keepalive,
             listen: self.listen.or(self.port.map(|p| format!("{}", p))),
+            listens: None,
             mode: self.mode,
             ws_proxy: None,
             insecure: None,

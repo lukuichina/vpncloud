@@ -94,7 +94,7 @@ macro_rules! io_error {
     } );
 }
 
-fn write_addr<W: Write>(addr: SocketAddr, mut out: W) -> Result<(), io::Error> {
+pub(crate) fn write_addr<W: Write>(addr: SocketAddr, mut out: W) -> Result<(), io::Error> {
     let addr = mapped_addr(addr);
     match mapped_addr(addr) {
         SocketAddr::V6(addr) => {
@@ -106,7 +106,7 @@ fn write_addr<W: Write>(addr: SocketAddr, mut out: W) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn read_addr<R: Read>(mut r: R) -> Result<SocketAddr, io::Error> {
+pub(crate) fn read_addr<R: Read>(mut r: R) -> Result<SocketAddr, io::Error> {
     let mut ip = [0u8; 16];
     r.read_exact(&mut ip)?;
     let port = r.read_u16::<NetworkEndian>()?;
@@ -617,7 +617,7 @@ impl ProxyConnection {
         Ok(con)
     }
 
-    fn read_message(&mut self) -> Result<Vec<u8>, io::Error> {
+    pub fn read_message(&mut self) -> Result<Vec<u8>, io::Error> {
         loop {
             match self.socket.read() {
                 Ok(Message::Binary(data)) => {

@@ -56,17 +56,21 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use crate::{
+    channel_io::{
+        spawn_io_threads, spawn_ws_thread, ChannelDevice, ChannelSocket, NetWake,
+    },
     cloud::GenericCloud,
-    config::{Args, Command, Config, DEFAULT_PORT},
+    config::{Args, Command, Config, DEFAULT_PORT, ListenMode, first_udp_addr, first_ws_url, has_websocket},
     crypto::Crypto,
     device::{Device, TunTapDevice, Type},
-    net::Socket,
+    net::{Socket, TransportId},
     oldconfig::OldConfigFile,
     payload::Protocol,
     util::SystemTimeSource,
     types::Address,
 };
 
+use crossbeam_channel::{bounded, Receiver, Sender};
 #[cfg(feature = "websocket")]
 use crate::wsproxy::ProxyConnection;
 
@@ -730,7 +734,7 @@ fn run_inner() {
         };
         config.merge_file(config_file)
     }
-    let listen_was_explicit = args.listen.is_some();
+    let listen_was_explicit = !args.listen.is_empty();
     config.merge_args(args);
 
     // --ip and --ipv6 can be specified together for dual-stack (IPv4+IPv6).
@@ -745,8 +749,15 @@ fn run_inner() {
     if !listen_was_explicit && config.ws_proxy.is_some() {
         if let Some(ref ws_proxy) = config.ws_proxy {
             let port = ws_proxy.rsplit(':').next().unwrap_or(ws_proxy);
-            config.listen = port.to_string();
-            info!("Auto-set listen port {} from --ws-proxy", port);
+            let addr = format!("0.0.0.0:{port}");
+            config.listen.push(ListenMode::Udp(
+                try_fail!(
+                    addr.parse::<SocketAddr>(),
+                    "Invalid ws-proxy port '{}': {}",
+                    port
+                ),
+            ));
+            info!("Auto-set UDP listen {addr} from --ws-proxy");
         }
     }
     debug!("Config: {:?}", config);
@@ -754,6 +765,124 @@ fn run_inner() {
         error!("Either password or private key must be set in config or given as parameter");
         return;
     }
+
+    // Multi-transport channel mode: when multiple listen entries are configured
+    // (e.g. UDP + WebSocket simultaneously, or multiple UDP addresses), use
+    // dual-thread I/O with per-transport workers feeding a shared channel that
+    // run_channel() processes.
+    let has_ws = has_websocket(&config.listen);
+    let has_udp = config.listen.iter().any(|m| matches!(m, ListenMode::Udp(_)));
+    if (has_udp && has_ws) || config.listen.len() > 1 {
+        info!("=== ENTERING CHANNEL MODE (multi-transport) ===");
+
+        // Create UDP sockets for all UDP listen entries.
+        let mut udp_sockets: Vec<(UdpSocket, TransportId)> = Vec::new();
+        let mut udp_idx: u8 = 0;
+        for mode in &config.listen {
+            if let ListenMode::Udp(addr) = mode {
+                let socket = try_fail!(
+                    UdpSocket::listen(&addr.to_string()),
+                    "Failed to open UDP socket {}: {}",
+                    addr
+                );
+                info!("UDP socket opened for listen={}", addr);
+                udp_sockets.push((socket, TransportId::Udp(udp_idx)));
+                udp_idx += 1;
+            }
+        }
+        assert!(!udp_sockets.is_empty(), "channel mode requires at least one UDP socket");
+
+        // Setup device (shared across all transports).
+        info!("channel mode: setup_device starting");
+        let device = setup_device(&config);
+        let device_ifname = device.ifname().to_string();
+        info!("channel mode: setup_device done, ifname={}", device_ifname);
+
+        let port_forwarding: Option<crate::port_forwarding::PortForwarding> = None;
+        let stats_file = None;
+
+        // Spawn net + device threads.
+        let (mut channel_socket, channel_device, _net_stop, _dev_stop, net_tx) =
+            spawn_io_threads(udp_sockets, device, None, config.poll_timeout_ms as u64);
+
+        // Spawn WS threads for each WebSocket listen entry.
+        #[cfg(feature = "websocket")]
+        {
+            let mut ws_idx: u8 = 0;
+            for mode in &config.listen {
+                if let ListenMode::WebSocket { url } = mode {
+                    let socket = if config.insecure {
+                        try_fail!(
+                            ProxyConnection::connect(url, config.sni.as_deref(), true),
+                            "Failed to open socket {}: {}",
+                            url
+                        )
+                    } else {
+                        try_fail!(ProxyConnection::listen(url), "Failed to open socket {}: {}", url)
+                    };
+                    let ws_proxy_peer = socket
+                        .address()
+                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+                    info!(
+                        "WS socket opened for listen={}, proxy assigned peer={}",
+                        url, ws_proxy_peer
+                    );
+
+                    let transport_id = TransportId::WebSocket(ws_idx);
+                    let (_ws_tx, ws_cmd_rx) = bounded::<crate::net::NetPacket>(4096);
+                    let ws_stop = _net_stop.clone();
+                    let ws_wake = NetWake::new().expect("failed to create net wake event");
+
+                    channel_socket.register_transport(
+                        transport_id,
+                        _ws_tx,
+                        ws_wake.clone(),
+                    );
+
+                    let net_tx_for_ws = net_tx.clone();
+                    thread::Builder::new()
+                        .name(format!("vpncloud-ws-{}", ws_idx))
+                        .spawn(move || {
+                            spawn_ws_thread(
+                                socket,
+                                transport_id,
+                                net_tx_for_ws,
+                                ws_cmd_rx,
+                                ws_stop,
+                                config.poll_timeout_ms as u64,
+                                ws_wake,
+                            )
+                        })
+                        .expect("failed to spawn WS thread");
+                    ws_idx += 1;
+                }
+            }
+        }
+
+        // Create GenericCloud with ChannelSocket.
+        match config.device_type {
+            Type::Tap => {
+                let mut cloud = GenericCloud::<
+                    ChannelDevice,
+                    payload::Frame,
+                    ChannelSocket,
+                    SystemTimeSource,
+                >::new(&config, channel_socket, channel_device, port_forwarding, stats_file);
+                run_channel_mode(&mut cloud, &config, &device_ifname);
+            }
+            Type::Tun => {
+                let mut cloud = GenericCloud::<
+                    ChannelDevice,
+                    payload::Packet,
+                    ChannelSocket,
+                    SystemTimeSource,
+                >::new(&config, channel_socket, channel_device, port_forwarding, stats_file);
+                run_channel_mode(&mut cloud, &config, &device_ifname);
+            }
+        }
+        return;
+    }
+
     #[cfg(feature = "websocket")]
     {
         info!("=== WEBSOCKET FEATURE IS ENABLED AT COMPILE TIME ===");
@@ -763,18 +892,20 @@ fn run_inner() {
         info!("=== WEBSOCKET FEATURE IS DISABLED AT COMPILE TIME ===");
     }
     #[cfg(feature = "websocket")]
-    if config.listen.starts_with("ws://") || config.listen.starts_with("wss://") {
+    if has_websocket(&config.listen) {
         info!("=== ENTERING RUN_WS PATH (websocket feature enabled) ===");
-        info!("Opening websocket/proxy socket for listen={}", config.listen);
+        let ws_url = first_ws_url(&config.listen)
+            .expect("has_websocket guarantees a WebSocket listen entry");
+        info!("Opening websocket/proxy socket for listen={}", ws_url);
         let socket = if config.insecure {
-            try_fail!(ProxyConnection::connect(&config.listen, config.sni.as_deref(), true), "Failed to open socket {}: {}", config.listen)
+            try_fail!(ProxyConnection::connect(&ws_url, config.sni.as_deref(), true), "Failed to open socket {}: {}", ws_url)
         } else {
-            try_fail!(ProxyConnection::listen(&config.listen), "Failed to open socket {}: {}", config.listen)
+            try_fail!(ProxyConnection::listen(&ws_url), "Failed to open socket {}: {}", ws_url)
         };
         // In WebSocket mode, the proxy assigns a UDP address to this client.
         // Use that assigned address as the local address (for routing).
         let mut ws_proxy_peer = socket.address().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-        info!("Socket opened for listen={}, WebSocket proxy assigned peer={}, starting cloud", config.listen, ws_proxy_peer);
+        info!("Socket opened for listen={}, WebSocket proxy assigned peer={}, starting cloud", ws_url, ws_proxy_peer);
 
         // Websocket-proxy branch: single-threaded WaitImpl event loop (legacy mode),
         // because ProxyConnection is not a plain UdpSocket and the dual-thread
@@ -1109,10 +1240,18 @@ fn run_inner() {
         return;
     }
     info!("=== ENTERING REGULAR RUN PATH ===");
-    info!("Opening UDP socket for listen={}", config.listen);
-    let socket = try_fail!(UdpSocket::listen(&config.listen), "Failed to open socket {}: {}", config.listen);
+    let listen_addr = first_udp_addr(&config.listen).unwrap_or_else(|| {
+        error!("no UDP listen address configured");
+        process::exit(-1)
+    });
+    info!("Opening UDP socket for listen={}", listen_addr);
+    let socket = try_fail!(
+        UdpSocket::listen(&listen_addr.to_string()),
+        "Failed to open socket {}: {}",
+        listen_addr
+    );
     let vpncloud_udp_addr = try_fail!(socket.address(), "Failed to get socket address: {}");
-    info!("UDP socket opened for listen={}, vpncloud UDP address={}", config.listen, vpncloud_udp_addr);
+    info!("UDP socket opened for listen={}, vpncloud UDP address={}", listen_addr, vpncloud_udp_addr);
 
     #[cfg(feature = "websocket")]
     if let Some(ref ws_proxy_addr) = config.ws_proxy {
@@ -1135,5 +1274,54 @@ fn run_inner() {
     match config.device_type {
         Type::Tap => run::<payload::Frame>(config, socket),
         Type::Tun => run::<payload::Packet>(config, socket),
+    }
+}
+
+/// Channel-mode event loop with reconnect. Drives `run_legacy()` (which dispatches
+/// to `run_channel()`) and re-establishes peer connections when the transport
+/// signals a disconnect (e.g. WebSocket proxy closed).
+fn run_channel_mode<D: Device, S: Socket + 'static, P: Protocol>(
+    cloud: &mut GenericCloud<D, P, S, SystemTimeSource>,
+    config: &Config,
+    device_ifname: &str,
+) {
+    for mut addr in config.peers.iter().cloned() {
+        let orig = addr.clone();
+        if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
+            addr = format!("{}:{}", addr, DEFAULT_PORT);
+        }
+        info!("channel mode: connecting to configured peer orig={} effective={}", orig, addr);
+        try_fail!(cloud.connect(&addr as &str), "Failed to send message to {}: {}", &addr);
+        cloud.add_reconnect_peer(addr);
+    }
+
+    loop {
+        let ok = cloud.run_legacy();
+        if ok {
+            break;
+        }
+        info!("channel mode: transport connection lost, attempting reconnect...");
+        if let Err(e) = cloud.socket_reconnect() {
+            error!("channel mode: socket reconnect failed: {}, exiting", e);
+            break;
+        }
+        for mut addr in config.peers.iter().cloned() {
+            let orig = addr.clone();
+            if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
+                addr = format!("{}:{}", addr, DEFAULT_PORT);
+            }
+            info!("channel mode: reconnecting to configured peer orig={} effective={}", orig, addr);
+            if let Err(e) = cloud.connect(&addr as &str) {
+                error!("channel mode: failed to reconnect to {}: {}, exiting", addr, e);
+                break;
+            }
+            cloud.add_reconnect_peer(addr);
+        }
+        info!("channel mode: reconnected, resuming event loop");
+    }
+
+    cleanup_tunnel_config(config, device_ifname);
+    if let Some(script) = config.ifdown.as_deref() {
+        run_script(script, device_ifname);
     }
 }

@@ -14,7 +14,7 @@ use std::{
 
 pub use crate::{
     cloud::GenericCloud,
-    config::{Config, CryptoConfig},
+    config::{Config, CryptoConfig, ListenMode},
     device::{MockDevice, Type},
     net::MockSocket,
     payload::{Frame, Packet, Protocol},
@@ -81,8 +81,13 @@ impl<P: Protocol> Simulator<P> {
     pub fn add_node(&mut self, nat: bool, config: &Config) -> SocketAddr {
         let mut config = config.clone();
         MockSocket::set_nat(nat);
-        config.listen = format!("[::]:{}", self.next_port);
-        let addr = config.listen.parse::<SocketAddr>().unwrap();
+        config.listen = vec![ListenMode::Udp(
+            format!("[::]:{}", self.next_port).parse::<SocketAddr>().unwrap(),
+        )];
+        let addr = match &config.listen[0] {
+            ListenMode::Udp(a) => *a,
+            ListenMode::WebSocket { .. } => unreachable!(),
+        };
         if config.crypto.password.is_none() && config.crypto.private_key.is_none() {
             config.crypto.password = Some("test123".to_string())
         }

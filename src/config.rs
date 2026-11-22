@@ -5,11 +5,84 @@
 use super::{device::Type, types::Mode, util::run_cmd, util::Duration};
 pub use crate::crypto::Config as CryptoConfig;
 
-use std::{cmp::{max, min}, collections::HashMap, ffi::OsStr, process, thread};
+use std::{
+    cmp::{max, min},
+    collections::HashMap,
+    ffi::OsStr,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    process, thread,
+};
 use structopt::{clap::Shell, StructOpt};
 
 pub const DEFAULT_PEER_TIMEOUT: u16 = 3600;
 pub const DEFAULT_PORT: u16 = 3210;
+
+/// 单个监听入口的传输类型与地址。`--listen` 可重复配置，每个入口独立。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ListenMode {
+    /// WebSocket 代理客户端（ws:// 或 wss://）
+    WebSocket { url: String },
+    /// UDP 服务端（udp:// 前缀可选，兼容 plain IP:PORT）
+    Udp(SocketAddr),
+}
+
+/// 解析单个 --listen 值为 ListenMode。
+/// 规则：ws:// / wss:// -> WebSocket；udp:// 剥离后或 plain IP:PORT -> UDP。
+pub fn parse_listen_mode(value: &str) -> Result<ListenMode, String> {
+    if value.starts_with("ws://") || value.starts_with("wss://") {
+        return Ok(ListenMode::WebSocket { url: value.to_string() });
+    }
+    let plain = value.strip_prefix("udp://").unwrap_or(value);
+    // Support bare port number (e.g. "-l 2600" -> [::]:2600), matching legacy behaviour.
+    if let Ok(port) = plain.parse::<u16>() {
+        return Ok(ListenMode::Udp(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            port,
+        )));
+    }
+    let addr = plain
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("Invalid listen address '{value}': {e}"))?;
+    Ok(ListenMode::Udp(addr))
+}
+
+/// 取第一个监听入口的本地 SocketAddr（供旧逻辑过渡使用；主机地址由 advertise 字段控制）。
+pub fn first_listen_addr(modes: &[ListenMode]) -> Option<SocketAddr> {
+    modes.iter().find_map(|m| match m {
+        ListenMode::Udp(addr) => Some(*addr),
+        ListenMode::WebSocket { .. } => None,
+    })
+}
+
+/// 取第一个 UDP 入口地址（供单 socket 旧代码过渡）；无则 None。
+pub fn first_udp_addr(modes: &[ListenMode]) -> Option<SocketAddr> {
+    first_listen_addr(modes)
+}
+
+/// 取第一个 WebSocket 入口 URL。
+pub fn first_ws_url(modes: &[ListenMode]) -> Option<String> {
+    modes.iter().find_map(|m| match m {
+        ListenMode::Udp(_) => None,
+        ListenMode::WebSocket { url } => Some(url.clone()),
+    })
+}
+
+/// 是否包含任意 WebSocket 入口。
+pub fn has_websocket(modes: &[ListenMode]) -> bool {
+    modes.iter().any(|m| matches!(m, ListenMode::WebSocket { .. }))
+}
+
+/// 把监听入口列表格式化为逗号分隔字符串（供配置向导/日志使用）。
+pub fn listen_modes_to_str(modes: &[ListenMode]) -> String {
+    modes
+        .iter()
+        .map(|m| match m {
+            ListenMode::Udp(addr) => addr.to_string(),
+            ListenMode::WebSocket { url } => url.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
 /// Upper bound (seconds) for the derived keepalive interval. Without this cap a
 /// large peer-timeout (e.g. 3600s) yields a ~29-minute keepalive, so a peer that
 /// silently restarts (losing all state) is not noticed until far too late. A
@@ -17,7 +90,7 @@ pub const DEFAULT_PORT: u16 = 3210;
 /// "non-init message from unknown peer" path.
 pub const KEEPALIVE_MAX: Duration = 10;
 
-#[derive(Deserialize, Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Config {
     pub device_type: Type,
     pub device_name: String,
@@ -44,7 +117,9 @@ pub struct Config {
     /// Skip TLS certificate verification for wss:// connections
     pub insecure: bool,
 
-    pub listen: String,
+    /// 所有监听入口（UDP 和/或 WebSocket）。`--listen` 可重复；
+    /// 默认监听 UDP 3210，与旧版行为一致。
+    pub listen: Vec<ListenMode>,
     pub ws_proxy: Option<String>,
     pub peers: Vec<String>,
     pub peer_timeout: Duration,
@@ -96,9 +171,13 @@ impl Default for Config {
             advertise_auto: false,
             ifup: None,
             ifdown: None,
-            crypto: CryptoConfig::default(),
+            crypto: {
+                let mut c = CryptoConfig::default();
+                c.rotate_interval = 120; // 120s default rotation (was 0 = disabled)
+                c
+            },
             insecure: false,
-            listen: "3210".to_string(),
+            listen: vec![ListenMode::Udp("0.0.0.0:3210".parse().unwrap())],
             ws_proxy: None,
             peers: vec![],
             peer_timeout: DEFAULT_PEER_TIMEOUT as Duration,
@@ -164,8 +243,22 @@ impl Config {
         if let Some(val) = file.ifdown {
             self.ifdown = Some(val);
         }
-        if let Some(val) = file.listen {
-            self.listen = val;
+        // --listen 支持多个入口。新版配置文件用 listens (Vec<String>)；
+        // 旧版单字符串 listen 继续兼容。非法地址直接失败退出（启动阶段）。
+        if let Some(mut val) = file.listens {
+            let modes: Vec<ListenMode> = val
+                .into_iter()
+                .map(|s| parse_listen_mode(&s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| fail!("Invalid listen in config file: {}", e))
+                .unwrap();
+            self.listen = modes;
+        } else if let Some(val) = file.listen {
+            self.listen = vec![try_fail!(
+                parse_listen_mode(&val),
+                "Invalid listen '{}' in config file: {}",
+                val
+            )];
         }
         if let Some(val) = file.ws_proxy {
             self.ws_proxy = Some(val);
@@ -287,8 +380,15 @@ impl Config {
         if let Some(val) = args.ifdown {
             self.ifdown = Some(val);
         }
-        if let Some(val) = args.listen {
-            self.listen = val;
+        if !args.listen.is_empty() {
+            let modes: Vec<ListenMode> = args
+                .listen
+                .iter()
+                .map(|s| parse_listen_mode(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| fail!("Invalid --listen argument: {e}"))
+                .unwrap();
+            self.listen = modes;
         }
         if let Some(val) = args.ws_proxy {
             self.ws_proxy = Some(val);
@@ -415,7 +515,21 @@ impl Config {
             sni: self.sni.clone(),
             advertise_addresses: Some(self.advertise_addresses),
             keepalive: self.keepalive,
-            listen: Some(self.listen),
+            // 旧版单字符串兼容：取第一个入口
+            listen: self.listen.first().map(|m| match m {
+                ListenMode::Udp(addr) => addr.to_string(),
+                ListenMode::WebSocket { url } => url.clone(),
+            }),
+            // 新版多入口列表
+            listens: Some(
+                self.listen
+                    .iter()
+                    .map(|m| match m {
+                        ListenMode::Udp(addr) => addr.to_string(),
+                        ListenMode::WebSocket { url } => url.clone(),
+                    })
+                    .collect(),
+            ),
             ws_proxy: self.ws_proxy.clone(),
             mode: Some(self.mode),
             peer_timeout: Some(self.peer_timeout),
@@ -521,9 +635,10 @@ pub struct Args {
     #[structopt(short, long)]
     pub device: Option<String>,
 
-    /// The port number (or ip:port) on which to listen for data
-    #[structopt(short, long)]
-    pub listen: Option<String>,
+    /// Listen address(es). Repeatable. Supports ws://, wss://, udp:// or plain IP:PORT (UDP).
+    /// Example: --listen ws://proxy.example.com:8080 --listen udp://0.0.0.0:3210
+    #[structopt(short = "l", long = "listen")]
+    pub listen: Vec<String>,
 
     /// Websocket proxy listen address IP:PORT (runs embedded in the VPN process)
     #[structopt(long = "ws-proxy")]
@@ -762,6 +877,8 @@ pub struct ConfigFile {
 
     pub crypto: CryptoConfig,
     pub listen: Option<String>,
+    /// 新版：多监听入口列表（每个可带 ws:///wss:///udp:// 前缀）
+    pub listens: Option<Vec<String>>,
     pub ws_proxy: Option<String>,
     pub peers: Option<Vec<String>>,
     pub peer_timeout: Option<Duration>,
@@ -834,8 +951,13 @@ statsd:
             advertise_addresses: Some(vec!["192.168.0.1".to_string(), "192.168.1.1".to_string()]),
             ifup: Some("ifconfig $IFNAME 10.0.1.1/16 mtu 1400 up".to_string()),
             ifdown: Some("true".to_string()),
-            crypto: CryptoConfig::default(),
+            crypto: {
+                let mut c = CryptoConfig::default();
+                c.rotate_interval = 120; // 120s default rotation (was 0 = disabled)
+                c
+            },
             listen: None,
+            listens: None,
             peers: Some(vec!["remote.machine.foo:3210".to_string(), "remote.machine.bar:3210".to_string()]),
             peer_timeout: Some(600),
             keepalive: Some(840),
@@ -889,6 +1011,7 @@ fn config_merge() {
         ifdown: Some("true".to_string()),
         crypto: CryptoConfig::default(),
         listen: None,
+        listens: None,
         peers: Some(vec!["remote.machine.foo:3210".to_string(), "remote.machine.bar:3210".to_string()]),
         peer_timeout: Some(600),
         keepalive: Some(840),
@@ -931,7 +1054,7 @@ fn config_merge() {
             advertise_auto: false,
             ifup: Some("ifconfig $IFNAME 10.0.1.1/16 mtu 1400 up".to_string()),
             ifdown: Some("true".to_string()),
-            listen: "3210".to_string(),
+            listen: vec![ListenMode::Udp("0.0.0.0:3210".parse().unwrap())],
             peers: vec!["remote.machine.foo:3210".to_string(), "remote.machine.bar:3210".to_string()],
             peer_timeout: 600,
             keepalive: Some(840),
@@ -959,7 +1082,7 @@ fn config_merge() {
         ifup: Some("ifconfig $IFNAME 10.0.1.2/16 mtu 1400 up".to_string()),
         ifdown: Some("ifconfig $IFNAME down".to_string()),
         password: Some("anothersecret".to_string()),
-        listen: Some("[::]:3211".to_string()),
+        listen: vec!["[::]:3211".to_string()],
         peer_timeout: Some(1801),
         keepalive: Some(850),
         switch_timeout: Some(301),
@@ -997,7 +1120,7 @@ fn config_merge() {
             ifup: Some("ifconfig $IFNAME 10.0.1.2/16 mtu 1400 up".to_string()),
             ifdown: Some("ifconfig $IFNAME down".to_string()),
             crypto: CryptoConfig { password: Some("anothersecret".to_string()), ..CryptoConfig::default() },
-            listen: "[::]:3211".to_string(),
+            listen: vec![ListenMode::Udp("[::]:3211".parse().unwrap())],
             peers: vec![
                 "remote.machine.foo:3210".to_string(),
                 "remote.machine.bar:3210".to_string(),
