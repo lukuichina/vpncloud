@@ -832,11 +832,13 @@ fn run_inner() {
                     let (_ws_tx, ws_cmd_rx) = bounded::<crate::net::NetPacket>(4096);
                     let ws_stop = _net_stop.clone();
                     let ws_wake = NetWake::new().expect("failed to create net wake event");
+                    let ws_health = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
                     channel_socket.register_transport(
                         transport_id,
                         _ws_tx,
                         ws_wake.clone(),
+                        ws_health.clone(),
                     );
 
                     let net_tx_for_ws = net_tx.clone();

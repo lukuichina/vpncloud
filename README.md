@@ -387,3 +387,15 @@ transport source address, which is more robust in certain NAT scenarios.
 ```sh
 $> vpncloud --allow-snat=false --ip 10.0.0.1/24 -p mysecret
 ```
+
+## COLD PATH silent ignore of non-init messages during pending handshake
+
+When a peer restarts and re-initiates a handshake while the local node still
+holds a pending init state for that peer's old address, any non-init encrypted
+packets arriving during the pending window (e.g. retransmissions of old keys)
+are silently ignored instead of returning `Crypto core not ready yet` errors.
+This prevents a restarting peer from being blackholed and allows automatic
+re-key without manual intervention.
+
+This behavior is automatic and requires no configuration. It applies to both
+UDP and WebSocket transport paths.

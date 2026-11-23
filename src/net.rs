@@ -26,7 +26,7 @@ use crate::{config::DEFAULT_PORT, port_forwarding::PortForwarding};
 
 /// 传输类型标识。同一个远端 IP:Port 可能同时通过 UDP 和 WebSocket 到达，
 /// TransportId 用于区分两条独立的通信路径，避免端点索引互相覆盖。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum TransportId {
     /// 第 N 个 UDP 监听/连接（u8 区分多个同类型传输实例）
     Udp(u8),
@@ -168,6 +168,22 @@ pub trait Socket: AsRawFd + Sized {
     fn preferred_transport_id(&self) -> TransportId {
         self.transport_id()
     }
+    /// Return all transport-qualified endpoints reachable at `addr`.
+    /// Legacy sockets expose only their default path; multiplexed sockets use
+    /// this to locate a healthy fallback transport when the preferred path fails.
+    fn endpoints_for(&self, addr: SocketAddr) -> Vec<PeerEndpoint> {
+        vec![PeerEndpoint::udp(addr, 0)]
+    }
+    /// Whether the worker backing this endpoint is currently able to send.
+    /// Native sockets are considered healthy unless their send call fails.
+    fn transport_healthy(&self, _endpoint: PeerEndpoint) -> bool {
+        true
+    }
+    /// Local addresses exposed by this socket. Multi-transport sockets return
+    /// every bound/assigned address so NodeInfo can advertise UDP and WS paths.
+    fn addresses(&self) -> Vec<SocketAddr> {
+        self.address().into_iter().collect()
+    }
     /// Send to a complete endpoint; the transport selects the correct underlying
     /// worker. Default implementation ignores the transport and uses `addr`.
     fn send_endpoint(&mut self, data: &[u8], endpoint: PeerEndpoint) -> Result<usize, io::Error> {
@@ -235,6 +251,22 @@ pub trait Socket: AsRawSocket + Sized {
     /// 默认实现等同于 transport_id()，ChannelSocket 会覆盖为优先 WebSocket。
     fn preferred_transport_id(&self) -> TransportId {
         self.transport_id()
+    }
+    /// Return all transport-qualified endpoints reachable at `addr`.
+    /// Legacy sockets expose only their default path; multiplexed sockets use
+    /// this to locate a healthy fallback transport when the preferred path fails.
+    fn endpoints_for(&self, addr: SocketAddr) -> Vec<PeerEndpoint> {
+        vec![PeerEndpoint::udp(addr, 0)]
+    }
+    /// Whether the worker backing this endpoint is currently able to send.
+    /// Native sockets are considered healthy unless their send call fails.
+    fn transport_healthy(&self, _endpoint: PeerEndpoint) -> bool {
+        true
+    }
+    /// Local addresses exposed by this socket. Multi-transport sockets return
+    /// every bound/assigned address so NodeInfo can advertise UDP and WS paths.
+    fn addresses(&self) -> Vec<SocketAddr> {
+        self.address().into_iter().collect()
     }
     /// Send to a complete endpoint; the transport selects the correct underlying
     /// worker. Default implementation ignores the transport and uses `addr`.

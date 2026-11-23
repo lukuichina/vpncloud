@@ -36,12 +36,14 @@ impl EpollWait {
         if res == -1 {
             return Err(io::Error::last_os_error());
         }
-        // Device: monitor read only
-        event.u64 = device as u64;
-        event.events = flags;
-        let res = unsafe { libc::epoll_ctl(poll_fd, libc::EPOLL_CTL_ADD, device, &mut event) };
-        if res == -1 {
-            return Err(io::Error::last_os_error());
+        // Device: monitor read only (skip if same fd as socket, e.g. channel mode dummy fd 0)
+        if device != socket {
+            event.u64 = device as u64;
+            event.events = flags;
+            let res = unsafe { libc::epoll_ctl(poll_fd, libc::EPOLL_CTL_ADD, device, &mut event) };
+            if res == -1 {
+                return Err(io::Error::last_os_error());
+            }
         }
         Ok(Self { poll_fd, event, socket, device, timeout })
     }

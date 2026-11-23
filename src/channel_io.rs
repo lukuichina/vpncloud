@@ -32,6 +32,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
     sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -167,15 +168,15 @@ fn adaptive_idle_wait_us(idle_spins: u32, configured_ms: u64) -> u64 {
 /// to the correct worker via `send_endpoint(endpoint.transport)`.
 pub struct ChannelSocket {
     net_rx: Receiver<NetPacket>,
-    /// Per-transport outbound channel + wake handle.
-    transports: HashMap<TransportId, (Sender<NetPacket>, NetWake)>,
+    /// Per-transport outbound channel + wake handle + health flag.
+    transports: HashMap<TransportId, (Sender<NetPacket>, NetWake, std::sync::Arc<AtomicBool>)>,
     local_addr: SocketAddr,
 }
 
 impl ChannelSocket {
     pub fn new(
         net_rx: Receiver<NetPacket>,
-        transports: HashMap<TransportId, (Sender<NetPacket>, NetWake)>,
+        transports: HashMap<TransportId, (Sender<NetPacket>, NetWake, std::sync::Arc<AtomicBool>)>,
         local_addr: SocketAddr,
     ) -> Self {
         Self { net_rx, transports, local_addr }
@@ -197,7 +198,9 @@ impl Clone for ChannelSocket {
 /// 连接远程 peer 的主要通路，UDP 仅用于本地 LAN。若只选 Udp(0)，则在
 /// 混合模式（-l wss://... -l 0.0.0.0:2600）下 init 消息会错误地走 UDP，
 /// 导致无法通过 WebSocket 隧道握手。
-fn default_transport(transports: &HashMap<TransportId, (Sender<NetPacket>, NetWake)>) -> TransportId {
+fn default_transport(
+    transports: &HashMap<TransportId, (Sender<NetPacket>, NetWake, Arc<AtomicBool>)>,
+) -> TransportId {
     transports
         .keys()
         .copied()
@@ -257,17 +260,75 @@ impl Socket for ChannelSocket {
     }
 
     /// Send to a complete endpoint: route to the worker owning `endpoint.transport`.
+    /// Non-blocking: if the worker's queue is full or the worker is disconnected,
+    /// mark that transport unhealthy and return `WouldBlock`/`NotConnected` so
+    /// `GenericCloud` can immediately fall back to another transport instead of
+    /// blocking the main event loop.
     fn send_endpoint(&mut self, data: &[u8], endpoint: PeerEndpoint) -> Result<usize, io::Error> {
         let dst = v6_to_v4_if_mapped(endpoint.addr);
         let pkt = NetPacket {
             endpoint: PeerEndpoint { addr: dst, transport: endpoint.transport },
             data: data.to_vec(),
         };
-        let (tx, wake) = self.transports.get(&endpoint.transport).cloned().expect("no transport channel");
-        tx.send(pkt)
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, format!("net channel send failed: {e}")))?;
-        wake.signal();
-        Ok(data.len())
+        let (tx, wake, health) = self.transports.get(&endpoint.transport).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("no transport channel for {:?}", endpoint.transport),
+            )
+        })?;
+        if !health.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("transport {:?} is reconnecting", endpoint.transport),
+            ));
+        }
+        match tx.try_send(pkt) {
+            Ok(()) => {
+                wake.signal();
+                Ok(data.len())
+            }
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                health.store(false, Ordering::Relaxed);
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("outbound queue for {:?} is full", endpoint.transport),
+                ))
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                health.store(false, Ordering::Relaxed);
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("worker for {:?} is disconnected", endpoint.transport),
+                ))
+            }
+        }
+    }
+
+    /// Whether the worker backing this endpoint is currently able to send.
+    fn transport_healthy(&self, endpoint: PeerEndpoint) -> bool {
+        self.transports
+            .get(&endpoint.transport)
+            .map(|(_, _, h)| h.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    /// Return all transport-qualified endpoints reachable at `addr`, ordered
+    /// with UDP paths before WebSocket fallback paths.
+    fn endpoints_for(&self, addr: SocketAddr) -> Vec<PeerEndpoint> {
+        let mut transports: Vec<TransportId> = self.transports.keys().copied().collect();
+        transports.sort(); // UDP paths precede WebSocket fallback paths.
+        transports
+            .into_iter()
+            .map(|transport| match transport {
+                TransportId::Udp(i) => PeerEndpoint::udp(addr, i),
+                TransportId::WebSocket(i) => PeerEndpoint::websocket(addr, i),
+            })
+            .collect()
+    }
+
+    /// Local addresses exposed by this socket.
+    fn addresses(&self) -> Vec<SocketAddr> {
+        vec![self.local_addr]
     }
 
     /// 仅按地址发送（旧路径）：使用默认传输。
@@ -581,6 +642,7 @@ pub fn net_thread(
     stop: std::sync::Arc<AtomicBool>,
     poll_timeout_ms: u64,
     _net_wake: NetWake,
+    health: std::sync::Arc<AtomicBool>,
 ) {
     let _ = socket.set_nonblocking(true);
     let transport_index = match transport_id {
@@ -600,11 +662,16 @@ pub fn net_thread(
             drained = true;
             match socket.send_to(&pkt.data, pkt.endpoint.addr) {
                 Ok(n) => {
+                    health.store(true, Ordering::Relaxed);
                     if n != pkt.data.len() {
                         warn!("[NET_THREAD] truncated send: wrote {n} of {} bytes to {}", pkt.data.len(), pkt.endpoint.addr);
                     }
                 }
                 Err(e) => {
+                    let unreachable = crate::error::io_unreachable(&e);
+                    if unreachable {
+                        health.store(false, Ordering::Relaxed);
+                    }
                     #[cfg(windows)]
                     {
                         if let Some(code) = e.raw_os_error() {
@@ -666,6 +733,11 @@ pub fn net_thread(
             }
             Ok(false) => {}
             Err(e) => {
+                use std::io::ErrorKind;
+                if e.kind() == ErrorKind::Interrupted {
+                    // Signal interruption (e.g. Ctrl+C): just retry the wait.
+                    continue;
+                }
                 warn!("[NET_THREAD] wait error: {e}");
             }
         }
@@ -674,8 +746,14 @@ pub fn net_thread(
         while let Ok(pkt) = net_cmd_rx.try_recv() {
             drained = true;
             match socket.send_to(&pkt.data, pkt.endpoint.addr) {
-                Ok(_) => {}
+                Ok(_) => {
+                    health.store(true, Ordering::Relaxed);
+                }
                 Err(e) => {
+                    let unreachable = crate::error::io_unreachable(&e);
+                    if unreachable {
+                        health.store(false, Ordering::Relaxed);
+                    }
                     #[cfg(windows)]
                     {
                         if let Some(code) = e.raw_os_error() {
@@ -848,6 +926,8 @@ pub fn spawn_io_threads(
         let net_stop_c = net_stop.clone();
         let net_wake = NetWake::new().expect("failed to create net wake event");
         let net_wake_thread = net_wake.clone();
+        let net_health = std::sync::Arc::new(AtomicBool::new(true));
+        let net_health_thread = net_health.clone();
         let local = match socket.local_addr() {
             Ok(a) => match a {
                 SocketAddr::V4(v4) => Some(SocketAddr::new(IpAddr::V4(*v4.ip()), v4.port())),
@@ -862,9 +942,9 @@ pub fn spawn_io_threads(
         let net_tx_c = net_tx.clone();
         thread::Builder::new()
             .name(format!("vpncloud-net-{}", idx))
-            .spawn(move || net_thread(socket, transport_id, net_tx_c, net_cmd_rx, net_stop_c, poll_timeout_ms, net_wake_thread))
+            .spawn(move || net_thread(socket, transport_id, net_tx_c, net_cmd_rx, net_stop_c, poll_timeout_ms, net_wake_thread, net_health_thread))
             .expect("failed to spawn net thread");
-        transports.insert(transport_id, (net_cmd_tx, net_wake));
+        transports.insert(transport_id, (net_cmd_tx, net_wake, net_health));
     }
     let local_addr = first_local.unwrap_or_else(|| {
         warn!("[SPAWN_IO_THREADS] failed to get any socket local addr");
@@ -900,8 +980,14 @@ pub fn spawn_io_threads(
 /// Register an additional transport (e.g. WebSocket) on an existing ChannelSocket,
 /// so `send_endpoint` can route packets to the correct worker thread.
 impl ChannelSocket {
-    pub fn register_transport(&mut self, transport_id: TransportId, tx: Sender<NetPacket>, wake: NetWake) {
-        self.transports.insert(transport_id, (tx, wake));
+    pub fn register_transport(
+        &mut self,
+        transport_id: TransportId,
+        tx: Sender<NetPacket>,
+        wake: NetWake,
+        health: std::sync::Arc<AtomicBool>,
+    ) {
+        self.transports.insert(transport_id, (tx, wake, health));
     }
 }
 
@@ -932,8 +1018,20 @@ pub fn spawn_ws_thread(
     let mut stop = stop;
     let mut idle = 0u32;
     let mut reconnect_delay_ms: u64 = 2000;
+    // 断线期间未发出的包，重连后优先重试，避免丢包。
+    let mut retry_packet: Option<crate::net::NetPacket> = None;
     while !stop.load(Ordering::Relaxed) {
-        // 处理主线程发来的发送请求；WS 重连期间直接丢弃旧包，避免阻塞通道
+        // 如果上一次发送失败，先重试该包。
+        if let Some(packet) = retry_packet.take() {
+            match socket.send(&packet.data, packet.endpoint.addr) {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("[WS_THREAD] retry send failed: {e}, keeping for next reconnect");
+                    retry_packet = Some(packet);
+                }
+            }
+        }
+        // 处理主线程发来的发送请求；WS 重连期间保留旧包，避免丢包。
         let mut drained = false;
         while let Ok(pkt) = net_cmd_rx.try_recv() {
             drained = true;
@@ -941,6 +1039,7 @@ pub fn spawn_ws_thread(
                 Ok(_) => {}
                 Err(e) => {
                     warn!("[WS_THREAD] send error: {e}, attempting reconnect");
+                    retry_packet = Some(pkt);
                     if let Err(re) = socket.reconnect() {
                         warn!("[WS_THREAD] reconnect failed: {re}, retrying in {}ms", reconnect_delay_ms);
                         sleep_interruptible(reconnect_delay_ms, &stop);
@@ -948,12 +1047,8 @@ pub fn spawn_ws_thread(
                     } else {
                         info!("[WS_THREAD] reconnect succeeded");
                         reconnect_delay_ms = 2000;
-                        // 清空断线期间积压的旧包，防止僵尸包被发到新连接
-                        while net_cmd_rx.try_recv().is_ok() {
-                            // 丢弃断线期间残留的旧包
-                        }
                     }
-                    // 丢弃当前包，等上层 VPN 握手重试通过新 WS 流重新发送
+                    // 不清空通道，旧包会在下一轮循环的 retry_packet 中重试
                     continue;
                 }
             }
@@ -963,8 +1058,8 @@ pub fn spawn_ws_thread(
                 drained = true;
                 match read_addr(std::io::Cursor::new(&data)) {
                     Ok(addr) => {
-                        let pkt = NetPacket {
-                            endpoint: PeerEndpoint {
+                        let pkt = crate::net::NetPacket {
+                            endpoint: crate::net::PeerEndpoint {
                                 addr,
                                 transport: transport_id,
                             },
@@ -999,15 +1094,129 @@ pub fn spawn_ws_thread(
                 } else {
                     info!("[WS_THREAD] reconnect succeeded");
                     reconnect_delay_ms = 2000;
-                    // 清空断线期间积压的旧包，防止僵尸包被发到新连接
-                    while net_cmd_rx.try_recv().is_ok() {
-                        // 丢弃断线期间残留的旧包
-                    }
                 }
+                // 不清空通道，旧包会在下一轮循环的 retry_packet 中重试
                 continue;
             }
         }
         if drained { idle = 0; }
     }
     info!("[WS_THREAD] stopped");
+}
+
+#[cfg(test)]
+mod multi_transport_tests {
+    use super::{ChannelSocket, MsgBuffer, NetPacket, NetWake};
+    use crate::net::{PeerEndpoint, Socket, TransportId};
+    use crossbeam_channel::bounded;
+    use std::{
+        collections::HashMap,
+        net::SocketAddr,
+        sync::atomic::{AtomicBool, Ordering},
+        sync::Arc,
+    };
+
+    #[test]
+    fn outbound_packets_are_dispatched_to_the_selected_transport() {
+        let (_in_tx, in_rx) = bounded::<NetPacket>(8);
+        let (udp_tx, udp_rx) = bounded::<NetPacket>(8);
+        let (ws_tx, ws_rx) = bounded::<NetPacket>(8);
+        let udp_id = TransportId::Udp(0);
+        let ws_id = TransportId::WebSocket(0);
+        let udp_health = Arc::new(AtomicBool::new(true));
+        let ws_health = Arc::new(AtomicBool::new(true));
+        let mut senders = HashMap::new();
+        senders.insert(
+            udp_id,
+            (udp_tx, NetWake::new().unwrap(), udp_health.clone()),
+        );
+        senders.insert(
+            ws_id,
+            (ws_tx, NetWake::new().unwrap(), ws_health.clone()),
+        );
+        let local: SocketAddr = "127.0.0.1:32100".parse().unwrap();
+        let mut socket = ChannelSocket::new(in_rx, senders, local);
+        let remote: SocketAddr = "192.0.2.50:3210".parse().unwrap();
+        let eps = socket.endpoints_for(remote);
+        assert_eq!(eps.len(), 2);
+        assert!(eps.iter().any(|e| *e == PeerEndpoint::udp(remote, 0)));
+        assert!(eps.iter().any(|e| *e == PeerEndpoint::websocket(remote, 0)));
+
+        socket
+            .send_endpoint(b"udp", PeerEndpoint::udp(remote, 0))
+            .unwrap();
+        socket
+            .send_endpoint(b"ws", PeerEndpoint::websocket(remote, 0))
+            .unwrap();
+
+        assert_eq!(udp_rx.try_recv().unwrap().data.as_slice(), b"udp");
+        assert_eq!(ws_rx.try_recv().unwrap().data.as_slice(), b"ws");
+        assert!(udp_rx.try_recv().is_err());
+        assert!(ws_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn offline_transport_fails_fast_without_blocking() {
+        let (_in_tx, in_rx) = bounded::<NetPacket>(8);
+        let udp_id = TransportId::Udp(0);
+        let udp_health = Arc::new(AtomicBool::new(false)); // unhealthy
+        let mut senders = HashMap::new();
+        senders.insert(
+            udp_id,
+            (
+                bounded::<NetPacket>(8).0,
+                NetWake::new().unwrap(),
+                udp_health.clone(),
+            ),
+        );
+        let local: SocketAddr = "127.0.0.1:32100".parse().unwrap();
+        let mut socket = ChannelSocket::new(in_rx, senders, local);
+        let remote: SocketAddr = "192.0.2.50:3210".parse().unwrap();
+        let ep = PeerEndpoint::udp(remote, 0);
+        let err = socket.send_endpoint(b"data", ep).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+        // Health must stay false (not flipped back by a failed send).
+        assert!(!udp_health.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn inbound_packets_keep_the_transport_identity() {
+        let (in_tx, in_rx) = bounded::<NetPacket>(8);
+        let udp_id = TransportId::Udp(0);
+        let ws_id = TransportId::WebSocket(1);
+        let udp_health = Arc::new(AtomicBool::new(true));
+        let ws_health = Arc::new(AtomicBool::new(true));
+        let mut senders = HashMap::new();
+        senders.insert(
+            udp_id,
+            (
+                bounded::<NetPacket>(8).0,
+                NetWake::new().unwrap(),
+                udp_health.clone(),
+            ),
+        );
+        senders.insert(
+            ws_id,
+            (
+                bounded::<NetPacket>(8).0,
+                NetWake::new().unwrap(),
+                ws_health.clone(),
+            ),
+        );
+        let local: SocketAddr = "127.0.0.1:32100".parse().unwrap();
+        let mut socket = ChannelSocket::new(in_rx, senders, local);
+        let remote: SocketAddr = "192.0.2.51:3210".parse().unwrap();
+        let endpoint = PeerEndpoint::websocket(remote, 1);
+        in_tx
+            .send(NetPacket {
+                endpoint,
+                data: b"from-ws".to_vec(),
+            })
+            .unwrap();
+
+        let mut buffer = MsgBuffer::new(0);
+        let received = socket.receive_endpoint(&mut buffer).unwrap();
+        assert_eq!(received, endpoint);
+        assert_eq!(buffer.message(), b"from-ws");
+    }
 }
