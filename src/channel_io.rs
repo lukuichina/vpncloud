@@ -319,7 +319,21 @@ impl Socket for ChannelSocket {
     /// with UDP paths before WebSocket fallback paths.
     fn endpoints_for(&self, addr: SocketAddr) -> Vec<PeerEndpoint> {
         let mut transports: Vec<TransportId> = self.transports.keys().copied().collect();
-        transports.sort(); // UDP paths precede WebSocket fallback paths.
+        // WebSocket first, then UDP — so remote -c targets use WS client path,
+        // not UDP loopback which would silently enqueue and drop.
+        transports.sort_by(|a, b| match (a, b) {
+            (TransportId::WebSocket(_), TransportId::Udp(_)) => std::cmp::Ordering::Less,
+            (TransportId::Udp(_), TransportId::WebSocket(_)) => std::cmp::Ordering::Greater,
+            _ => a.cmp(b),
+        });
+        // Loopback addresses (127.0.0.1, ::1) via UDP never reach a remote peer.
+        // When -c targets a loopback address (e.g. 127.0.0.1:2600 for a WS proxy
+        // server on this host), route through any WebSocket transport rather than
+        // UDP, which would silently enqueue and drop. Retain all WebSocket
+        // transports (WebSocket(0) for client, WebSocket(1) for proxy server).
+        if addr.ip().is_loopback() {
+            transports.retain(|t| matches!(t, TransportId::WebSocket(_)));
+        }
         transports
             .into_iter()
             .map(|transport| match transport {
@@ -1008,6 +1022,12 @@ impl ChannelSocket {
                 info!("[CHANNEL_IO] registered WS proxy local address: {}", addr);
             }
         }
+    }
+
+    /// Get a clone of the sender for a given transport, used by external components
+    /// (e.g. WebSocket proxy server) to inject packets into the Cloud.
+    pub fn transport_tx(&self, transport_id: TransportId) -> Option<Sender<NetPacket>> {
+        self.transports.get(&transport_id).map(|(tx, _, _)| tx.clone())
     }
 }
 

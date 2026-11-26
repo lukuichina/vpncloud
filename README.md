@@ -63,6 +63,38 @@ $> vpncloud --ws-proxy :8080 --password mysecret --ip 10.0.0.1/24
 # UDP listens on 0.0.0.0:8080, WS proxy listens on 0.0.0.0:8080
 ```
 
+### WS proxy server + WS client dual role (channel mode)
+
+When both `--ws-proxy` (WebSocket proxy **server**) and `-l wss://` / `ws://`
+(WebSocket **client**) are given in the same process, vpnCloud enters channel
+mode: both transports share one `GenericCloud` and one event loop.
+
+```sh
+# Node acts as both:
+#   - WS proxy server on :2600 (accepts WS client connections from other nodes)
+#   - WS client to vc2.swings.one (connects to an upstream WS proxy)
+$> vpncloud --ip 10.99.0.2 --ipv6 fd03::2 \
+    -l 2600 --ws-proxy 2600 \
+    -l wss://vc2.swings.one -c 127.0.0.1:808 \
+    -p 123
+```
+
+Behavior:
+
+* `--ws-proxy 2600` — UDP and WS proxy server listen on port 2600. Remote nodes
+  can connect via `-l ws://<this-node>:2600` and their traffic is tunneled
+  through this node's Cloud.
+* `-l wss://vc2.swings.one` — WS client connects to an upstream WS proxy
+  (e.g. via cloudflare tunnel). Traffic from this node to upstream peers is
+  carried over the WS tunnel.
+* `-c 127.0.0.1:808` — explicit UDP connect target. Loopback targets are routed
+  through WebSocket transports only (never UDP loopback), so `-c 127.0.0.1:PORT`
+  reliably reaches a local WS proxy server.
+
+The WS proxy server is started **before** the WS client, so it is available for
+incoming connections even if the upstream WS client connection is slow or
+temporarily blocked.
+
 ### WebSocket Reconnection
 
 When running in WebSocket proxy mode (`--ws-proxy`), vpnCloud automatically

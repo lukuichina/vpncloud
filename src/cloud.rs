@@ -2554,7 +2554,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             let raw = src;
             let src = crate::net::mapped_addr(src);
             let len = buffer.len();
-            debug!("UDP RX raw: {} bytes from {} (mapped={})", len, raw, src);
+            debug!("UDP RX raw: {} bytes from {} (mapped={}) via {:?}", len, raw, src, endpoint.transport);
             if len == 0 {
                 debug!("UDP RX empty datagram from {}, ignoring", src);
                 continue;

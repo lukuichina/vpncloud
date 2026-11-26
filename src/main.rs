@@ -56,16 +56,18 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use crate::{
+    channel_io::{ChannelSocket, ChannelDevice, NetWake, spawn_io_threads, spawn_ws_thread},
     cloud::GenericCloud,
-    config::{Args, Command, Config, DEFAULT_PORT},
+    config::{Args, Command, Config, DEFAULT_PORT, ListenMode},
     crypto::Crypto,
     device::{Device, TunTapDevice, Type},
-    net::Socket,
+    net::{Socket, TransportId},
     oldconfig::OldConfigFile,
     payload::Protocol,
     util::SystemTimeSource,
     types::Address,
 };
+use crossbeam_channel::bounded;
 
 #[cfg(feature = "websocket")]
 use crate::wsproxy::ProxyConnection;
@@ -582,8 +584,52 @@ fn run<P: Protocol>(mut config: Config, socket: UdpSocket) {
     // Remove IPv6 claim routes / secondary addresses we installed so the host
     // does not keep stale routes pointing at a dead tunnel interface.
     cleanup_tunnel_config(&config, &device_ifname);
-    if let Some(script) = config.ifdown {
-        run_script(&script, &device_ifname);
+    if let Some(ref script) = config.ifdown {
+        run_script(script, &device_ifname);
+    }
+}
+
+/// Channel-mode event loop with reconnect for WS client + WS proxy server dual-role.
+/// Drives `run_legacy()` (which dispatches to `run_channel()`) and re-establishes
+/// peer connections when the transport signals a disconnect.
+fn run_ws_channel_mode<D: Device, P: Protocol, S: Socket + 'static>(
+    cloud: &mut GenericCloud<D, P, S, SystemTimeSource>,
+    config: &Config,
+    device_ifname: &str,
+) {
+    for mut addr in config.peers.iter().cloned() {
+        let orig = addr.clone();
+        if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
+            addr = format!("{}:{}", addr, DEFAULT_PORT);
+        }
+        info!("ws channel mode: adding configured peer for passive connect orig={} effective={}", orig, addr);
+        cloud.add_reconnect_peer(addr);
+    }
+
+    loop {
+        let ok = cloud.run_legacy();
+        if ok {
+            break;
+        }
+        info!("ws channel mode: transport connection lost, attempting reconnect...");
+        if let Err(e) = cloud.socket_reconnect() {
+            error!("ws channel mode: socket reconnect failed: {}, exiting", e);
+            break;
+        }
+        for mut addr in config.peers.iter().cloned() {
+            let orig = addr.clone();
+            if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
+                addr = format!("{}:{}", addr, DEFAULT_PORT);
+            }
+            info!("ws channel mode: re-adding configured peer orig={} effective={}", orig, addr);
+            cloud.add_reconnect_peer(addr);
+        }
+        info!("ws channel mode: reconnected, resuming event loop");
+    }
+
+    cleanup_tunnel_config(&config, device_ifname);
+    if let Some(ref script) = config.ifdown {
+        run_script(script, &device_ifname);
     }
 }
 
@@ -781,6 +827,154 @@ fn run_inner() {
     });
     #[cfg(feature = "websocket")]
     if let Some(ws_url) = ws_url {
+        // Dual-role detection: when both --ws-proxy (server) and -l ws:// (client) are configured,
+        // use channel mode so both transports share one Cloud and one GenericCloud.
+        if config.ws_proxy.is_some() {
+            info!("=== ENTERING CHANNEL MODE (WS client + WS proxy server) ===");
+
+            // ---- Build UDP sockets from all UDP listen entries (incl. --ws-proxy port) ----
+            let mut udp_sockets: Vec<(UdpSocket, TransportId)> = Vec::new();
+            let mut udp_idx: u8 = 0;
+            for mode in &config.listen {
+                if let ListenMode::Udp(addr) = mode {
+                    let socket = try_fail!(
+                        UdpSocket::listen(&addr.to_string()),
+                        "Failed to open UDP socket {}: {}",
+                        addr
+                    );
+                    info!("UDP socket opened for listen={}", addr);
+                    udp_sockets.push((socket, TransportId::Udp(udp_idx)));
+                    udp_idx += 1;
+                }
+            }
+            assert!(!udp_sockets.is_empty(), "channel mode requires at least one UDP socket");
+
+            // ---- Setup device (shared across all transports) ----
+            info!("channel mode: setup_device starting");
+            let device = setup_device(&config);
+            let device_ifname = device.ifname().to_string();
+            info!("channel mode: setup_device done, ifname={}", device_ifname);
+
+            let port_forwarding: Option<crate::port_forwarding::PortForwarding> = None;
+            let stats_file = None;
+
+            // ---- Spawn net + device threads ----
+            let (mut channel_socket, channel_device, _net_stop, _dev_stop, net_tx) =
+                spawn_io_threads(udp_sockets, device, None, config.poll_timeout_ms as u64);
+            info!("channel mode: spawn_io_threads done");
+
+            // ---- Spawn WS proxy server FIRST (so it is available even if WS client
+            // connection to remote is slow or blocked) ----
+            // WS proxy server injects received WS packets into Cloud via the inbound channel sender.
+            // Cloud replies via WebSocket transport sender -> WS thread -> WS client.
+            if let Some(ref ws_proxy_addr) = config.ws_proxy {
+                let ws_proxy_listen = if ws_proxy_addr.starts_with(':') {
+                    format!("0.0.0.0{}", ws_proxy_addr)
+                } else if ws_proxy_addr.parse::<u16>().is_ok() {
+                    format!("0.0.0.0:{}", ws_proxy_addr)
+                } else {
+                    ws_proxy_addr.clone()
+                };
+                let ws_proxy_listen_clone = ws_proxy_listen.clone();
+                // WS proxy server runs in transparent proxy mode (net_tx=None):
+                // it forwards UDP packets directly via its own ephemeral UDP socket,
+                // Cloud replies via the same UDP socket, WS proxy forwards replies
+                // back via WebSocket. Cloud does not need to know about WS transport.
+                thread::spawn(move || {
+                    if let Err(err) = wsproxy::run_proxy(&ws_proxy_listen_clone, None) {
+                        error!("WebSocket proxy error: {}", err);
+                    }
+                });
+                info!("Embedded WebSocket proxy spawned, listening on {} (transparent proxy mode)", ws_proxy_listen);
+            }
+            info!("channel mode: WS proxy server started, now creating WS client threads");
+
+            // ---- Spawn WS client threads for each WebSocket listen entry ----
+            let mut ws_idx: u8 = 0;
+            for mode in &config.listen {
+                if let ListenMode::WebSocket { url } = mode {
+                    let socket = if config.insecure {
+                        try_fail!(
+                            ProxyConnection::connect(url, config.sni.as_deref(), true),
+                            "Failed to open socket {}: {}",
+                            url
+                        )
+                    } else {
+                        try_fail!(ProxyConnection::listen(url), "Failed to open socket {}: {}", url)
+                    };
+                    let _ws_proxy_peer = socket
+                        .address()
+                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+                    info!(
+                        "WS socket opened for listen={}, proxy assigned peer={}",
+                        url, _ws_proxy_peer
+                    );
+
+                    let transport_id = TransportId::WebSocket(ws_idx);
+                    let (_ws_tx, ws_cmd_rx) = bounded::<crate::net::NetPacket>(4096);
+                    let ws_stop = _net_stop.clone();
+                    let ws_wake = NetWake::new().expect("failed to create net wake event");
+                    let ws_health = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+                    channel_socket.register_transport(
+                        transport_id,
+                        _ws_tx,
+                        ws_wake.clone(),
+                        ws_health.clone(),
+                        None,
+                    );
+
+                    let net_tx_for_ws = net_tx.clone();
+                    thread::Builder::new()
+                        .name(format!("vpncloud-ws-{}", ws_idx))
+                        .spawn(move || {
+                            spawn_ws_thread(
+                                socket,
+                                transport_id,
+                                net_tx_for_ws,
+                                ws_cmd_rx,
+                                ws_stop,
+                                config.poll_timeout_ms as u64,
+                                ws_wake,
+                                ws_health,
+                            )
+                        })
+                        .expect("failed to spawn WS thread");
+                    ws_idx += 1;
+                }
+            }
+
+            // ---- Create GenericCloud with ChannelSocket/ChannelDevice ----
+            info!("channel mode: creating GenericCloud");
+            match config.device_type {
+                Type::Tap => {
+                    let mut cloud =
+                        GenericCloud::<ChannelDevice, payload::Frame, ChannelSocket, SystemTimeSource>::new(
+                            &config,
+                            channel_socket,
+                            channel_device,
+                            port_forwarding,
+                            stats_file,
+                        );
+                    info!("channel mode: GenericCloud created (Tap)");
+                    run_ws_channel_mode(&mut cloud, &config, &device_ifname);
+                }
+                Type::Tun => {
+                    let mut cloud =
+                        GenericCloud::<ChannelDevice, payload::Packet, ChannelSocket, SystemTimeSource>::new(
+                            &config,
+                            channel_socket,
+                            channel_device,
+                            port_forwarding,
+                            stats_file,
+                        );
+                    info!("channel mode: GenericCloud created (Tun)");
+                    run_ws_channel_mode(&mut cloud, &config, &device_ifname);
+                }
+            }
+            return;
+        }
+
         info!("=== ENTERING RUN_WS PATH (websocket feature enabled) ===");
         info!("Opening websocket/proxy socket for listen={}", ws_url);
         let socket = if config.insecure {
