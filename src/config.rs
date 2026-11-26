@@ -33,12 +33,16 @@ pub fn parse_listen_mode(value: &str) -> Result<ListenMode, String> {
         return Ok(ListenMode::WebSocket { url: value.to_string() });
     }
     let plain = value.strip_prefix("udp://").unwrap_or(value);
-    // Support bare port number (e.g. "-l 2600" -> [::]:2600), matching legacy behaviour.
+    // Support bare port number (e.g. "-l 2600").
+    // On Windows, default to IPv4 wildcard (0.0.0.0) to avoid dual-stack socket
+    // issues where IPv4 packets from certain sources don't trigger FD_READ.
+    // Users can explicitly use "[::]:port" for IPv6 dual-stack.
+    #[cfg(windows)]
+    let default_ip = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+    #[cfg(not(windows))]
+    let default_ip = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
     if let Ok(port) = plain.parse::<u16>() {
-        return Ok(ListenMode::Udp(SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            port,
-        )));
+        return Ok(ListenMode::Udp(SocketAddr::new(default_ip, port)));
     }
     let addr = plain
         .parse::<SocketAddr>()

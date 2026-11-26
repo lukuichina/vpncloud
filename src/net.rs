@@ -330,7 +330,14 @@ pub fn parse_listen(addr: &str, default_port: u16) -> SocketAddr {
     } else if addr.contains(':') {
         try_fail!(addr.parse::<SocketAddr>(), "Invalid address: {}: {}", addr)
     } else if let Ok(port) = addr.parse::<u16>() {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)
+        // On Windows, default to IPv4 wildcard (0.0.0.0) to avoid dual-stack socket
+        // issues where IPv4 packets from certain sources don't trigger FD_READ.
+        // Users can explicitly use "[::]:port" for IPv6 dual-stack.
+        #[cfg(windows)]
+        let default_ip = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        #[cfg(not(windows))]
+        let default_ip = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+        SocketAddr::new(default_ip, port)
     } else {
         let ip = try_fail!(addr.parse::<IpAddr>(), "Invalid addr: {}");
         SocketAddr::new(ip, default_port)

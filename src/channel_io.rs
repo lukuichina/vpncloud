@@ -170,16 +170,17 @@ pub struct ChannelSocket {
     net_rx: Receiver<NetPacket>,
     /// Per-transport outbound channel + wake handle + health flag.
     transports: HashMap<TransportId, (Sender<NetPacket>, NetWake, std::sync::Arc<AtomicBool>)>,
-    local_addr: SocketAddr,
+    /// All local addresses exposed by this socket (UDP bind address(es) + WS proxy assigned address(es)).
+    local_addrs: Vec<SocketAddr>,
 }
 
 impl ChannelSocket {
     pub fn new(
         net_rx: Receiver<NetPacket>,
         transports: HashMap<TransportId, (Sender<NetPacket>, NetWake, std::sync::Arc<AtomicBool>)>,
-        local_addr: SocketAddr,
+        local_addrs: Vec<SocketAddr>,
     ) -> Self {
-        Self { net_rx, transports, local_addr }
+        Self { net_rx, transports, local_addrs }
     }
 }
 
@@ -188,7 +189,7 @@ impl Clone for ChannelSocket {
         Self {
             net_rx: self.net_rx.clone(),
             transports: self.transports.clone(),
-            local_addr: self.local_addr,
+            local_addrs: self.local_addrs.clone(),
         }
     }
 }
@@ -288,7 +289,9 @@ impl Socket for ChannelSocket {
                 Ok(data.len())
             }
             Err(crossbeam_channel::TrySendError::Full(_)) => {
-                health.store(false, Ordering::Relaxed);
+                // Queue congestion is not a connection failure; do not mark
+                // the transport unhealthy. Return WouldBlock so the caller can
+                // retry or try an alternate transport.
                 Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!("outbound queue for {:?} is full", endpoint.transport),
@@ -326,9 +329,9 @@ impl Socket for ChannelSocket {
             .collect()
     }
 
-    /// Local addresses exposed by this socket.
+    /// Local addresses exposed by this socket (all transports).
     fn addresses(&self) -> Vec<SocketAddr> {
-        vec![self.local_addr]
+        self.local_addrs.clone()
     }
 
     /// 仅按地址发送（旧路径）：使用默认传输。
@@ -346,16 +349,30 @@ impl Socket for ChannelSocket {
 
     /// 优先返回 WebSocket 传输，用于 connect_sock，避免混合模式（-l wss://... -l 0.0.0.0:2600）
     /// 下 init 消息错误地走 UDP 导致无法通过 WebSocket 隧道握手。
+    /// 选择确定性、健康优先的 WS 传输：按 TransportId 排序（稳定顺序），优先选择健康的。
     fn preferred_transport_id(&self) -> TransportId {
-        self.transports
+        let mut ws_transports: Vec<TransportId> = self
+            .transports
             .keys()
             .copied()
-            .find(|t| matches!(t, TransportId::WebSocket(_)))
-            .unwrap_or_else(|| self.transport_id())
+            .filter(|t| matches!(t, TransportId::WebSocket(_)))
+            .collect();
+        // Sort for deterministic order (by index).
+        ws_transports.sort();
+        // Prefer healthy WS transport.
+        for t in &ws_transports {
+            if let Some((_, _, health)) = self.transports.get(t) {
+                if health.load(Ordering::Relaxed) {
+                    return *t;
+                }
+            }
+        }
+        // If no healthy WS, return first WS (deterministic) or fallback.
+        ws_transports.first().copied().unwrap_or_else(|| self.transport_id())
     }
 
     fn address(&self) -> Result<SocketAddr, io::Error> {
-        Ok(self.local_addr)
+        self.local_addrs.first().copied().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no local address"))
     }
 
     fn pending(&self) -> usize {
@@ -911,16 +928,16 @@ pub fn spawn_io_threads(
     std::sync::Arc<AtomicBool>,
     Sender<NetPacket>,
 ) {
-    assert!(!udp_sockets.is_empty(), "at least one UDP socket is required");
     let (net_tx, net_rx) = bounded::<NetPacket>(CHANNEL_CAP);
     let (dev_tx, dev_rx) = bounded::<Vec<u8>>(CHANNEL_CAP);
     let (dev_cmd_tx, dev_cmd_rx) = bounded::<Vec<u8>>(CHANNEL_CAP);
 
     let mut transports = HashMap::new();
     let mut net_stop = std::sync::Arc::new(AtomicBool::new(false));
-    let local_addr = None::<SocketAddr>;
 
-    let mut first_local = None;
+    // Collect all local addresses from UDP sockets for address publishing.
+    let mut local_addrs: Vec<SocketAddr> = Vec::new();
+
     for (idx, (socket, transport_id)) in udp_sockets.into_iter().enumerate() {
         let (net_cmd_tx, net_cmd_rx) = bounded::<NetPacket>(CHANNEL_CAP);
         let net_stop_c = net_stop.clone();
@@ -928,17 +945,13 @@ pub fn spawn_io_threads(
         let net_wake_thread = net_wake.clone();
         let net_health = std::sync::Arc::new(AtomicBool::new(true));
         let net_health_thread = net_health.clone();
-        let local = match socket.local_addr() {
-            Ok(a) => match a {
-                SocketAddr::V4(v4) => Some(SocketAddr::new(IpAddr::V4(*v4.ip()), v4.port())),
-                SocketAddr::V6(v6) => Some(SocketAddr::new(IpAddr::V6(*v6.ip()), v6.port())),
-            },
-            Err(e) => {
-                warn!("[SPAWN_IO_THREADS] failed to get socket local addr: {e}");
-                None
-            }
-        };
-        if first_local.is_none() { first_local = local; }
+        if let Ok(local) = socket.local_addr() {
+            let local = match local {
+                SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V4(*v4.ip()), v4.port()),
+                SocketAddr::V6(v6) => SocketAddr::new(IpAddr::V6(*v6.ip()), v6.port()),
+            };
+            local_addrs.push(local);
+        }
         let net_tx_c = net_tx.clone();
         thread::Builder::new()
             .name(format!("vpncloud-net-{}", idx))
@@ -946,10 +959,10 @@ pub fn spawn_io_threads(
             .expect("failed to spawn net thread");
         transports.insert(transport_id, (net_cmd_tx, net_wake, net_health));
     }
-    let local_addr = first_local.unwrap_or_else(|| {
+    if local_addrs.is_empty() {
         warn!("[SPAWN_IO_THREADS] failed to get any socket local addr");
-        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-    });
+        local_addrs.push(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
+    }
 
     let dev_stop = std::sync::Arc::new(AtomicBool::new(false));
     let dev_stop_c = dev_stop.clone();
@@ -964,7 +977,7 @@ pub fn spawn_io_threads(
         .spawn(move || device_thread(device, dev_tx, dev_cmd_rx, dev_stop_c, poll_timeout_ms, dev_wake_thread))
         .expect("failed to spawn device thread");
 
-    let channel_socket = ChannelSocket::new(net_rx, transports, local_addr);
+    let channel_socket = ChannelSocket::new(net_rx, transports, local_addrs);
     let channel_device = ChannelDevice::new(
         dev_rx,
         dev_cmd_tx,
@@ -986,8 +999,15 @@ impl ChannelSocket {
         tx: Sender<NetPacket>,
         wake: NetWake,
         health: std::sync::Arc<AtomicBool>,
+        local_addr: Option<SocketAddr>,
     ) {
         self.transports.insert(transport_id, (tx, wake, health));
+        if let Some(addr) = local_addr {
+            if !self.local_addrs.contains(&addr) {
+                self.local_addrs.push(addr);
+                info!("[CHANNEL_IO] registered WS proxy local address: {}", addr);
+            }
+        }
     }
 }
 
@@ -1012,22 +1032,41 @@ pub fn spawn_ws_thread(
     stop: std::sync::Arc<AtomicBool>,
     poll_timeout_ms: u64,
     _net_wake: NetWake,
+    health: std::sync::Arc<AtomicBool>,
 ) {
     let _ = poll_timeout_ms;
     info!("[WS_THREAD] started, transport={transport_id:?}");
     let mut stop = stop;
     let mut idle = 0u32;
     let mut reconnect_delay_ms: u64 = 2000;
-    // 断线期间未发出的包，重连后优先重试，避免丢包。
-    let mut retry_packet: Option<crate::net::NetPacket> = None;
+    // 断线期间未发出的包，重连后优先重试，避免丢包。使用 FIFO 队列避免覆盖。
+    const RETRY_QUEUE_CAP: usize = 256;
+    let mut retry_queue: std::collections::VecDeque<crate::net::NetPacket> = std::collections::VecDeque::new();
+    let mut retry_drop_count: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
-        // 如果上一次发送失败，先重试该包。
-        if let Some(packet) = retry_packet.take() {
-            match socket.send(&packet.data, packet.endpoint.addr) {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("[WS_THREAD] retry send failed: {e}, keeping for next reconnect");
-                    retry_packet = Some(packet);
+        // 重试队列中的包优先发送。队列非空时，新包也追加到队尾，不绕过队首。
+        let has_retry = !retry_queue.is_empty();
+        if has_retry {
+            while let Some(packet) = retry_queue.front().cloned() {
+                match socket.send(&packet.data, packet.endpoint.addr) {
+                    Ok(_) => {
+                        health.store(true, Ordering::Relaxed);
+                        reconnect_delay_ms = 2000;
+                        retry_queue.pop_front();
+                    }
+                    Err(e) => {
+                        health.store(false, Ordering::Relaxed);
+                        warn!("[WS_THREAD] retry send failed: {e}, attempting reconnect");
+                        if let Err(re) = socket.reconnect() {
+                            warn!("[WS_THREAD] reconnect failed: {re}, retrying in {}ms", reconnect_delay_ms);
+                            sleep_interruptible(reconnect_delay_ms, &stop);
+                            reconnect_delay_ms = (reconnect_delay_ms * 2).min(30000);
+                        } else {
+                            info!("[WS_THREAD] reconnect succeeded");
+                            // Don't reset backoff yet; only reset after successful I/O.
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -1035,26 +1074,43 @@ pub fn spawn_ws_thread(
         let mut drained = false;
         while let Ok(pkt) = net_cmd_rx.try_recv() {
             drained = true;
+            // If retry queue is non-empty, queue new packets instead of sending directly
+            if !retry_queue.is_empty() {
+                if retry_queue.len() < RETRY_QUEUE_CAP {
+                    retry_queue.push_back(pkt);
+                } else {
+                    retry_drop_count += 1;
+                    warn!("[WS_THREAD] retry queue full, dropping packet (total drops: {})", retry_drop_count);
+                }
+                continue;
+            }
             match socket.send(&pkt.data, pkt.endpoint.addr) {
-                Ok(_) => {}
-                Err(e) => {
+                Ok(_) => { health.store(true, Ordering::Relaxed); reconnect_delay_ms = 2000; }
+                Err(e) => { health.store(false, Ordering::Relaxed);
                     warn!("[WS_THREAD] send error: {e}, attempting reconnect");
-                    retry_packet = Some(pkt);
+                    if retry_queue.len() < RETRY_QUEUE_CAP {
+                        retry_queue.push_back(pkt);
+                    } else {
+                        retry_drop_count += 1;
+                        warn!("[WS_THREAD] retry queue full, dropping packet (total drops: {})", retry_drop_count);
+                    }
                     if let Err(re) = socket.reconnect() {
                         warn!("[WS_THREAD] reconnect failed: {re}, retrying in {}ms", reconnect_delay_ms);
                         sleep_interruptible(reconnect_delay_ms, &stop);
                         reconnect_delay_ms = (reconnect_delay_ms * 2).min(30000);
                     } else {
                         info!("[WS_THREAD] reconnect succeeded");
-                        reconnect_delay_ms = 2000;
+                        // Don't reset backoff yet; only reset after successful I/O.
                     }
-                    // 不清空通道，旧包会在下一轮循环的 retry_packet 中重试
+                    // 不清空通道，旧包会在下一轮循环的 retry_queue 中重试
                     continue;
                 }
             }
         }
         match socket.read_message() {
             Ok(data) if !data.is_empty() => {
+                health.store(true, Ordering::Relaxed);
+                reconnect_delay_ms = 2000;
                 drained = true;
                 match read_addr(std::io::Cursor::new(&data)) {
                     Ok(addr) => {
@@ -1086,16 +1142,18 @@ pub fn spawn_ws_thread(
                     }
                     continue;
                 }
+                health.store(false, Ordering::Relaxed);
                 warn!("[WS_THREAD] read error: {e}, attempting reconnect");
                 if let Err(re) = socket.reconnect() {
                     warn!("[WS_THREAD] reconnect failed: {re}, retrying in {}ms", reconnect_delay_ms);
                     sleep_interruptible(reconnect_delay_ms, &stop);
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(30000);
                 } else {
+                    health.store(true, Ordering::Relaxed);
                     info!("[WS_THREAD] reconnect succeeded");
-                    reconnect_delay_ms = 2000;
+                    // Don't reset backoff yet; only reset after successful I/O.
                 }
-                // 不清空通道，旧包会在下一轮循环的 retry_packet 中重试
+                // 不清空通道，旧包会在下一轮循环的 retry_queue 中重试
                 continue;
             }
         }

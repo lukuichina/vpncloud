@@ -16,7 +16,9 @@ pub fn io_unreachable(err: &io::Error) -> bool {
         Some(10051) | Some(10065) | Some(10049) => true, // Windows WSAENETUNREACH / WSAEHOSTUNREACH / WSAEADDRNOTAVAIL
         _ => matches!(
             err.kind(),
-            io::ErrorKind::AddrNotAvailable | io::ErrorKind::NotConnected
+            io::ErrorKind::AddrNotAvailable
+            // NotConnected is NOT included: it can mean local worker/transport
+            // unavailable (e.g., WS Worker reconnecting), not remote host down.
         ),
     }
 }

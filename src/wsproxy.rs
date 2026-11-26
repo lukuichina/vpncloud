@@ -11,6 +11,7 @@ use crate::{
     util::MsgBuffer,
 };
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
+use crossbeam_channel::Sender;
 use std::{
     collections::VecDeque,
     error::Error as StdError,
@@ -158,9 +159,9 @@ fn set_tcp_keepalive(_stream: &TcpStream) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn serve_proxy_connection(stream: TcpStream) -> Result<(), io::Error> {
+fn serve_proxy_connection(stream: TcpStream, net_tx: Option<Sender<crate::net::NetPacket>>) -> Result<(), io::Error> {
     let peer = stream.peer_addr()?;
-    info!("WS client {} connected", peer);
+    info!("WS client {} connected, net_tx is_some={}", peer, net_tx.is_some());
     stream.set_nodelay(true)?;
     set_tcp_keepalive(&stream)?;
     let mut websocket = io_error!(accept(stream), "Failed to initialize websocket with {}: {}", peer)?;
@@ -280,23 +281,62 @@ fn serve_proxy_connection(stream: TcpStream) -> Result<(), io::Error> {
                     };
                     match msg {
                         Message::Binary(data) => {
+                            info!("Proxy: received binary msg, len={}", data.len());
                             if data.len() >= 18 {
-                                let mut dst = read_addr(Cursor::new(&data))?;
-                                // Windows dual-stack socket needs IPv4-mapped IPv6 for IPv4 destinations
-                                #[cfg(target_os = "windows")]
-                                if let IpAddr::V4(ipv4) = dst.ip() {
-                                    let octets = ipv4.octets();
-                                    let ipv6 = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, u16::from_be_bytes([octets[0], octets[1]]), u16::from_be_bytes([octets[2], octets[3]]));
-                                    dst = SocketAddr::new(IpAddr::V6(ipv6), dst.port());
-                                }
-                                #[cfg(not(target_os = "windows"))]
-                                if let IpAddr::V6(ipv6) = dst.ip() {
-                                    if let Some(ipv4) = ipv6.to_ipv4_mapped() {
-                                        dst = SocketAddr::new(IpAddr::V4(ipv4), dst.port());
+                                let _dst = match read_addr(Cursor::new(&data)) {
+                                    Ok(d) => {
+                                        info!("Proxy: read_addr dst={}", d);
+                                        d
                                     }
-                                }
-                                if let Err(e) = udpsocket.send_to(&data[18..], dst) {
-                                    error!("Proxy: failed to forward to {}: {}", dst, e);
+                                    Err(e) => {
+                                        error!("Proxy: read_addr failed: {}", e);
+                                        continue;
+                                    }
+                                };
+                                // Inject packet directly into net thread via channel instead of UDP forwarding.
+                                // This avoids Windows same-process UDP loopback issues.
+                                // Use the proxy's ephemeral UDP address as the source endpoint.
+                                if let Some(ref tx) = net_tx {
+                                    if let Ok(local_addr) = udpsocket.local_addr() {
+                                        let endpoint = crate::net::PeerEndpoint::udp(local_addr, 0);
+                                        let pkt = crate::net::NetPacket {
+                                            endpoint,
+                                            data: data[18..].to_vec(),
+                                        };
+                                        if let Err(e) = tx.send(pkt) {
+                                            error!("Proxy: failed to inject packet: {}", e);
+                                        } else {
+                                            info!("Proxy: injected {} bytes to net thread", data.len() - 18);
+                                        }
+                                    } else {
+                                        error!("Proxy: failed to get local UDP address");
+                                    }
+                                } else {
+                                    // Fallback to UDP forwarding if no channel available
+                                    #[cfg(target_os = "windows")]
+                                    if let IpAddr::V6(ipv6) = _dst.ip() {
+                                        if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+                                            let _dst = SocketAddr::new(IpAddr::V4(ipv4), _dst.port());
+                                        }
+                                    }
+                                    // Use the wsproxy's own UDP socket (udpsocket) to forward packets
+                                    // to the destination address read from the WebSocket message.
+                                    // This is the same as v0.2.1 design: each wsproxy connection has
+                                    // its own ephemeral UDP socket for forwarding to remote peers.
+                                    match udpsocket.send_to(&data[18..], _dst) {
+                                        Ok(n) => info!("Proxy: forwarded {} bytes to {} via wsproxy UDP socket", n, _dst),
+                                        Err(e) => error!("Proxy: failed to forward to {} via wsproxy UDP socket: {}", _dst, e),
+                                    }
+                                    continue;
+                                    #[cfg(not(target_os = "windows"))]
+                                    if let IpAddr::V6(ipv6) = _dst.ip() {
+                                        if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+                                            let _dst = SocketAddr::new(IpAddr::V4(ipv4), _dst.port());
+                                        }
+                                    }
+                                    if let Err(e) = udpsocket.send_to(&data[18..], _dst) {
+                                        error!("Proxy: failed to forward to {}: {}", _dst, e);
+                                    }
                                 }
                             }
                         }
@@ -422,17 +462,35 @@ fn serve_proxy_connection(stream: TcpStream) -> Result<(), io::Error> {
                     let msg = io_error!(websocket.read(), "Failed to read message on websocket {}: {}", peer)?;
                     match msg {
                         Message::Binary(data) => {
-                            let mut dst = read_addr(Cursor::new(&data))?;
-                            // Convert IPv6-mapped IPv4 to pure IPv4 for IPv4 socket
-                            if let IpAddr::V6(ipv6) = dst.ip() {
-                                if let Some(ipv4) = ipv6.to_ipv4_mapped() {
-                                    dst = SocketAddr::new(IpAddr::V4(ipv4), dst.port());
+                            let _dst = read_addr(Cursor::new(&data))?;
+                            // Inject packet directly into net thread via channel instead of UDP forwarding.
+                            if let Some(ref tx) = net_tx {
+                                if let Ok(local_addr) = udpsocket.local_addr() {
+                                    let endpoint = crate::net::PeerEndpoint::udp(local_addr, 0);
+                                    let pkt = crate::net::NetPacket {
+                                        endpoint,
+                                        data: data[18..].to_vec(),
+                                    };
+                                    if let Err(e) = tx.send(pkt) {
+                                        error!("Proxy: failed to inject packet: {}", e);
+                                    } else {
+                                        info!("Proxy: injected {} bytes to net thread", data.len() - 18);
+                                    }
+                                } else {
+                                    error!("Proxy: failed to get local UDP address");
                                 }
-                            }
-                            // Forward to the destination specified in the packet (original vpncloud design)
-                            match udpsocket.send_to(&data[18..], dst) {
-                                Ok(_) => {}
-                                Err(e) => error!("Proxy: failed to forward to {}: {}", dst, e),
+                            } else {
+                                // Fallback to UDP forwarding if no channel available
+                                // Convert IPv6-mapped IPv4 to pure IPv4 for IPv4 socket
+                                if let IpAddr::V6(ipv6) = _dst.ip() {
+                                    if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+                                        let _dst = SocketAddr::new(IpAddr::V4(ipv4), _dst.port());
+                                    }
+                                }
+                                match udpsocket.send_to(&data[18..], _dst) {
+                                    Ok(_) => {}
+                                    Err(e) => error!("Proxy: failed to forward to {}: {}", _dst, e),
+                                }
                             }
                         }
                         Message::Ping(data) => {
@@ -474,7 +532,8 @@ fn serve_proxy_connection(stream: TcpStream) -> Result<(), io::Error> {
     }
 }
 
-pub fn run_proxy(listen: &str) -> Result<(), io::Error> {
+pub fn run_proxy(listen: &str, net_tx: Option<Sender<crate::net::NetPacket>>) -> Result<(), io::Error> {
+    info!("run_proxy called, net_tx is_some={}", net_tx.is_some());
     use std::net::{TcpListener, TcpStream, SocketAddr, IpAddr, Ipv4Addr};
     use std::thread;
     
@@ -513,8 +572,9 @@ pub fn run_proxy(listen: &str) -> Result<(), io::Error> {
             Ok(stream) => {
                 let peer = stream.peer_addr().unwrap_or(local_addr);
                 info!("WebSocket proxy: accepted connection from {}", peer);
+                let net_tx_c = net_tx.clone();
                 thread::spawn(move || {
-                    if let Err(err) = serve_proxy_connection(stream) {
+                    if let Err(err) = serve_proxy_connection(stream, net_tx_c) {
                         error!("Error on connection {}: {}", peer, err);
                     }
                 });
